@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TagForge</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <link rel="icon" type="image/x-icon" href="{{ url_for('static', filename='favicon.ico') }}">
+</head>
+<body>
+    <div class="app">
+        <header class="header">
+            <div class="path-input-container">
+                <input type="text" id="datasetPath" data-i18n-placeholder="dataset_path_placeholder">
+                <button id="loadDatasetBtn" data-i18n="load_dataset">Загрузить</button>
+            </div>
+            <div class="header-right-group">
+                <div class="rating-progress-container" id="ratingProgressContainer" style="display: none;">
+                    <div class="rating-progress-bar">
+                        <div id="ratingProgressFill" style="width:0%"></div>
+                    </div>
+                    <span id="ratingCurrentFile" class="rating-current-file"></span>
+                </div>
+                <div class="dataset-info">
+                    <span id="imageCount">0</span>
+                    <span data-i18n="images_count">изображений</span>
+                </div>
+            </div>
+        </header>
+
+        <div class="main-layout">
+            <aside class="sidebar" id="sidebar">
+                <div class="sidebar-toggle" id="sidebarToggle">◀</div>
+                <div class="sidebar-content">
+                    <div class="tabs">
+                        <button class="tab-button active" data-tab="mass" data-i18n="mass_edit">Массовое редактирование</button>
+                        <button class="tab-button" data-tab="point" data-i18n="point_edit">Точечное редактирование</button>
+                        <button class="tab-button" data-tab="analysis" data-i18n="analysis">Анализ датасета</button>
+                        <button class="tab-button" data-tab="settings" data-i18n="settings">Настройки</button>
+                    </div>
+                    <div class="sidebar-footer">
+                        <a href="https://github.com/yourusername/tagforge" target="_blank" class="sidebar-logo-link">
+                            <img src="{{ url_for('static', filename='logo.png') }}" alt="TagForge" class="sidebar-logo">
+                        </a>
+                    </div>
+                </div>
+            </aside>
+            <main class="main-content" id="mainContent">
+            </main>
+        </div>
+    </div>
+
+    <div id="modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-body">
+                <div class="modal-image">
+                    <img id="modalImg" src="" alt="">
+                </div>
+                <div class="modal-caption" id="modalCaption">
+                    <div class="info-badges" id="infoBadges"></div>
+                    <div id="modalDynamicContent"></div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <div class="modal-footer-center">
+                    <button id="prevBtn" data-i18n-title="prev">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <path d="M15 18L9 12L15 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
+                    </button>
+                    <input type="number" id="navInput" min="1" value="1">
+                    <span id="totalCount"></span>
+                    <button id="nextBtn" data-i18n-title="next">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <path d="M9 18L15 12L9 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
+                    </button>
+                </div>
+                <div class="modal-footer-right">
+                    <button id="toggleVocabBtn" class="btn-icon" title="Словарь">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
+                            <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" />
+                        </svg>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <script src="{{ url_for('static', filename='js/widgets.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
