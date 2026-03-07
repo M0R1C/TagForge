@@ -1,0 +1,1 @@
+Place the file model.onnx + selected_tags.csv here. Take the ones you like from https://huggingface.co/SmilingWolf
