@@ -1,7 +1,5 @@
 ![TagForge Logo](static/logo.png)
 
-# TagForge
-
 ![GitHub
 stars](https://img.shields.io/github/stars/M0R1C/TagForge?style=for-the-badge)
 ![GitHub
