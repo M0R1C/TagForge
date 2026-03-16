@@ -31,12 +31,25 @@ def init_db():
             )
         ''')
         c.execute('''
+            CREATE TABLE IF NOT EXISTS dataset_flags (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                color TEXT DEFAULT '#3b82f6',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        c.execute('''
             CREATE TABLE IF NOT EXISTS widget_layouts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 layout TEXT NOT NULL,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        c.execute("PRAGMA table_info(image_ratings)")
+        columns = [col[1] for col in c.fetchall()]
+        if 'file_hash' not in columns:
+            c.execute("ALTER TABLE image_ratings ADD COLUMN file_hash TEXT")
+            conn.commit()
         c.execute('''
             CREATE TABLE IF NOT EXISTS dataset_vocabulary (
                 dataset_path TEXT PRIMARY KEY,
@@ -59,22 +72,28 @@ def get_all_translations(lang):
         c.execute('SELECT key, value FROM translations WHERE lang=?', (lang,))
         return dict(c.fetchall())
 
-def get_nsfw_tags():
+def get_all_flags():
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
-        c.execute('SELECT tag FROM nsfw_tags')
-        return [row[0] for row in c.fetchall()]
+        c.execute('SELECT name, color FROM dataset_flags ORDER BY name')
+        return [{'name': row[0], 'color': row[1]} for row in c.fetchall()]
 
-def add_nsfw_tag(tag):
+def add_flag(name, color):
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
-        c.execute('INSERT OR IGNORE INTO nsfw_tags (tag) VALUES (?)', (tag,))
+        c.execute('INSERT OR IGNORE INTO dataset_flags (name, color) VALUES (?, ?)', (name, color))
         conn.commit()
 
-def remove_nsfw_tag(tag):
+def delete_flag(name):
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
-        c.execute('DELETE FROM nsfw_tags WHERE tag=?', (tag,))
+        c.execute('DELETE FROM dataset_flags WHERE name = ?', (name,))
+        conn.commit()
+
+def rename_flag(old_name, new_name, new_color):
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute('UPDATE dataset_flags SET name = ?, color = ? WHERE name = ?', (new_name, new_color, old_name))
         conn.commit()
 
 def get_setting(key, default=None):
@@ -107,14 +126,22 @@ def get_global_widget_layout():
         row = c.fetchone()
         return row[0] if row else None
 
-def save_image_rating(dataset_path, filename, rating):
+def save_image_rating(dataset_path, filename, rating, file_hash=None):
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
         c.execute('''
-            INSERT OR REPLACE INTO image_ratings (dataset_path, filename, rating)
-            VALUES (?, ?, ?)
-        ''', (dataset_path, filename, rating))
+            INSERT OR REPLACE INTO image_ratings (dataset_path, filename, rating, file_hash)
+            VALUES (?, ?, ?, ?)
+        ''', (dataset_path, filename, rating, file_hash))
         conn.commit()
+
+def get_image_rating_and_hash(dataset_path, filename):
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute('SELECT rating, file_hash FROM image_ratings WHERE dataset_path=? AND filename=?',
+                  (dataset_path, filename))
+        row = c.fetchone()
+        return row if row else (None, None)
 
 def get_image_rating(dataset_path, filename):
     with sqlite3.connect(DB_PATH) as conn:
