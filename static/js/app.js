@@ -1,5 +1,7 @@
 let currentDatasetPath = '';
+let currentDatasetName = '';
 let currentImages = [];
+let currentSettings = {};
 let currentTags = [];
 let selectedTags = [];
 let currentImageIndex = 0;
@@ -11,6 +13,9 @@ let translations = {};
 let backupActive = false;
 let backupInterval = null;
 let vocabOrder = [];
+let zoomEnabled = true;
+let zoomFactor = 2;
+let pendingDeleteFilename = null;
 
 let currentImagesRaw = [];
 let filters = {
@@ -77,6 +82,58 @@ if (navInput) {
 
 let tagSearch, tagListDiv, imageGrid;
 
+const deleteConfirmModal = document.getElementById('deleteConfirmModal');
+const confirmDeleteBtn = document.getElementById('confirmDeleteBtn');
+const cancelDeleteBtn = document.getElementById('cancelDeleteBtn');
+const dontAskCheckbox = document.getElementById('dontAskCheckbox');
+
+function showDeleteConfirm(filename) {
+    pendingDeleteFilename = filename;
+    deleteConfirmModal.classList.add('show');
+}
+
+function hideDeleteConfirm() {
+    deleteConfirmModal.classList.remove('show');
+    pendingDeleteFilename = null;
+    dontAskCheckbox.checked = false;
+}
+
+confirmDeleteBtn.addEventListener('click', () => {
+    if (pendingDeleteFilename) {
+        if (dontAskCheckbox.checked) {
+            sessionStorage.setItem('dontAskDelete', 'true');
+        }
+        handleDeleteImage(pendingDeleteFilename);
+        hideDeleteConfirm();
+    }
+});
+
+cancelDeleteBtn.addEventListener('click', hideDeleteConfirm);
+
+deleteConfirmModal.addEventListener('click', (e) => {
+    if (e.target === deleteConfirmModal) hideDeleteConfirm();
+});
+
+function getColumnCount(containerWidth) {
+    const minWidth = 180;
+    const gap = 20;
+    let columns = Math.floor((containerWidth + gap) / (minWidth + gap));
+    return Math.max(1, columns);
+}
+
+function getItemPosition(index, columns, rowHeight, gap, containerWidth) {
+    const row = Math.floor(index / columns);
+    const col = index % columns;
+    const totalGapWidth = (columns - 1) * gap;
+    const colWidth = (containerWidth - totalGapWidth) / columns;
+    const left = col * (colWidth + gap);
+    return {
+        top: row * rowHeight,
+        left: left + 'px',
+        width: colWidth + 'px'
+    };
+}
+
 async function loadTranslations(lang) {
     const resp = await fetch(`/api/translations/${lang}`);
     translations = await resp.json();
@@ -132,6 +189,34 @@ function startBackupPolling() {
     }, 500);
 }
 
+async function handleDeleteImage(filename) {
+    const success = await deleteImage(filename);
+    if (success) {
+        currentImagesRaw = currentImagesRaw.filter(img => img.filename !== filename);
+        currentImages = currentImages.filter(img => img.filename !== filename);
+        renderImageGrid(currentImages);
+        document.getElementById('imageCount').textContent = currentImagesRaw.length;
+        await refreshTagList();
+        if (document.querySelector('.tab-button.active').dataset.tab === 'analysis') {
+            refreshAnalysis();
+        }
+    }
+}
+
+async function deleteImage(filename) {
+    const resp = await fetch('/api/delete-image', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename })
+    });
+    const data = await resp.json();
+    if (data.error) {
+        alert('Ошибка удаления: ' + data.error);
+        return false;
+    }
+    return true;
+}
+
 function stopBackupPolling() {
     if (backupInterval) {
         clearInterval(backupInterval);
@@ -160,12 +245,20 @@ function updateBackupButtonsUI() {
 async function loadSettings() {
     const resp = await fetch('/api/settings');
     const settings = await resp.json();
+    currentSettings = settings;
     currentLanguage = settings.language;
+    zoomEnabled = settings.zoom_enabled !== undefined ? settings.zoom_enabled : true;
+    zoomFactor = settings.zoom_factor !== undefined ? settings.zoom_factor : 2;
     document.documentElement.style.setProperty('--accent-color', settings.accent_color);
     const hoverColor = adjustColor(settings.accent_color, -20);
     document.documentElement.style.setProperty('--accent-hover', hoverColor);
     updateGradientVariables(settings.accent_color);
     await loadTranslations(currentLanguage);
+
+    const wdInput = document.getElementById('workingDirectoryInput');
+    if (wdInput && settings.working_directory !== undefined) {
+        wdInput.value = settings.working_directory;
+    }
 }
 
 function adjustColor(hex, percent) {
@@ -332,6 +425,13 @@ function renderTab(tabName) {
         }
         stopAutoStatusPolling();
         attachFilterHandlers();
+    } else if (tabName === 'datasets') {
+        mainContent.innerHTML = `<div id="datasetsContainer"></div>`;
+        if (window.DatasetsTab) {
+            window.DatasetsTab.init(document.getElementById('datasetsContainer'));
+        } else {
+            mainContent.innerHTML = `<p>Загрузка модуля датасетов...</p>`;
+        }
     } else if (tabName === 'analysis') {
         mainContent.innerHTML = getAnalysisHTML();
         initAnalysisTab();
@@ -568,6 +668,22 @@ function getSettingsHTML() {
             <h3 data-i18n="accent_color">Акцентный цвет</h3>
             <input type="color" id="accentColorPicker" value="#3b82f6">
 
+            <h3 data-i18n="working_directory">Рабочая директория</h3>
+            <input type="text" id="workingDirectoryInput" placeholder="/path/to/workspace" value="">
+
+            <h3 data-i18n="zoom_settings">Настройки лупы</h3>
+            <div class="form-group">
+                <label class="custom-checkbox">
+                    <input type="checkbox" id="zoomEnabledCheckbox" checked>
+                    <span class="checkmark"></span>
+                    <span data-i18n="zoom_enabled">Включить лупу в редакторе</span>
+                </label>
+            </div>
+            <div class="form-group">
+                <label data-i18n="zoom_factor">Коэффициент увеличения:</label>
+                <input type="number" id="zoomFactorInput" min="1" max="5" step="0.5" value="2">
+            </div>
+
             <!-- Разделитель перед опасной кнопкой -->
             <hr style="margin: 24px 0; border: 1px solid var(--border-color);">
 
@@ -595,6 +711,7 @@ loadBtn.addEventListener('click', async () => {
         return;
     }
     currentDatasetPath = path;
+    currentDatasetName = path.split(/[\\/]/).pop();
     imageCountSpan.textContent = data.count;
     startRatingPolling();
 
@@ -809,6 +926,13 @@ function getAspectLabel(ratio) {
     return best;
 }
 
+function escapeHtml(text) {
+    if (!text) return '';
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
 function renderTagList(tags) {
     if (!tagListDiv) return;
     tagListDiv.innerHTML = '';
@@ -836,25 +960,179 @@ function renderTagList(tags) {
 }
 
 function renderImageGrid(images) {
-    if (!imageGrid) return;
-    imageGrid.innerHTML = '';
+    const container = document.getElementById('imageGrid');
+    if (!container) return;
+
+    if (container._virtualScrollCleanup) {
+        container._virtualScrollCleanup();
+    }
+    if (container._clickHandler) {
+        container.removeEventListener('click', container._clickHandler);
+        container._clickHandler = null;
+    }
+
+    container.innerHTML = '';
+    container.style.position = 'relative';
+    container.style.height = '1px';
+
     if (images.length === 0) {
-        imageGrid.innerHTML = `<p style="color: #888; text-align: center;">${t('no_images')}</p>`;
+        container.innerHTML = '<p style="color: #888; text-align: center;">' + t('no_images') + '</p>';
         return;
     }
-    images.forEach((img, idx) => {
-        const card = document.createElement('div');
-        card.className = 'image-card';
-        card.innerHTML = `
-            <img src="/api/image/${encodeURIComponent(img.filename)}?t=${Date.now()}" alt="${img.filename}" loading="lazy">
-            <div class="image-info">
-                <span>${img.filename}</span>
-                <span>${img.tag_count} ${t('tag_count')}</span>
-            </div>
+
+    const CARD_HEIGHT = 210;
+    const GAP = 20;
+    const ROW_HEIGHT = CARD_HEIGHT + GAP;
+    const BUFFER = 5;
+
+    let visibleItems = new Map();
+    let currentRange = { start: 0, end: 0 };
+    let lastContainerWidth = container.clientWidth;
+
+    const scrollContainer = document.querySelector('.image-grid-container');
+    if (!scrollContainer) {
+        console.error('Не найден контейнер прокрутки .image-grid-container');
+        return;
+    }
+
+    function updateVisibleRange() {
+        if (!scrollContainer) return;
+
+        const scrollTop = scrollContainer.scrollTop;
+        const viewportHeight = scrollContainer.clientHeight;
+        const containerWidth = container.clientWidth;
+
+        if (containerWidth !== lastContainerWidth) {
+            visibleItems.forEach(el => el.remove());
+            visibleItems.clear();
+            currentRange.start = 0;
+            currentRange.end = 0;
+            lastContainerWidth = containerWidth;
+        }
+
+        const columns = getColumnCount(containerWidth);
+        const totalRows = Math.ceil(images.length / columns);
+        const totalHeight = totalRows * ROW_HEIGHT;
+        container.style.height = totalHeight + 'px';
+
+        const firstVisibleRow = Math.floor(scrollTop / ROW_HEIGHT);
+        const lastVisibleRow = Math.floor((scrollTop + viewportHeight) / ROW_HEIGHT);
+
+        const startRow = Math.max(0, firstVisibleRow - BUFFER);
+        const endRow = Math.min(totalRows - 1, lastVisibleRow + BUFFER);
+
+        const newStart = startRow * columns;
+        const newEnd = Math.min(images.length - 1, (endRow + 1) * columns - 1);
+
+        if (newStart === currentRange.start && newEnd === currentRange.end && visibleItems.size > 0) return;
+
+        currentRange.start = newStart;
+        currentRange.end = newEnd;
+
+        for (let [index, el] of visibleItems.entries()) {
+            if (index < newStart || index > newEnd) {
+                el.remove();
+                visibleItems.delete(index);
+            }
+        }
+
+        for (let i = newStart; i <= newEnd; i++) {
+            if (visibleItems.has(i)) continue;
+            const img = images[i];
+            const div = createCardElement(img, i, columns, ROW_HEIGHT, GAP, containerWidth);
+            container.appendChild(div);
+            visibleItems.set(i, div);
+        }
+    }
+
+    function createCardElement(img, index, columns, rowHeight, gap, containerWidth) {
+        const div = document.createElement('div');
+        div.className = 'image-card';
+        div.dataset.filename = img.filename;
+        div.dataset.index = index;
+
+        const pos = getItemPosition(index, columns, rowHeight, gap, containerWidth);
+        div.style.position = 'absolute';
+        div.style.top = pos.top + 'px';
+        div.style.left = pos.left;
+        div.style.width = pos.width;
+        div.style.height = CARD_HEIGHT + 'px';
+
+        const v = img.mtime ? img.mtime : Date.now();
+        const thumbSrc = `/api/thumbnail/${encodeURIComponent(img.filename)}?v=${v}`;
+
+        const imgElement = document.createElement('img');
+        imgElement.src = thumbSrc;
+        imgElement.alt = img.filename;
+        imgElement.loading = 'lazy';
+        imgElement.decoding = 'async';
+        imgElement.classList.add('image-card-img');
+
+        const infoDiv = document.createElement('div');
+        infoDiv.className = 'image-info';
+        infoDiv.innerHTML = `<span class="image-filename">${escapeHtml(img.filename)}</span><span class="image-tag-count">${t('tags_label')}: ${img.tag_count}</span>`;
+
+        const deleteBtn = document.createElement('button');
+        deleteBtn.className = 'delete-image-btn';
+        deleteBtn.dataset.filename = img.filename;
+        deleteBtn.innerHTML = `
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                <path d="M18 6L6 18M6 6l12 12"/>
+            </svg>
         `;
-        card.addEventListener('click', () => openModal(idx));
-        imageGrid.appendChild(card);
+
+        div.appendChild(imgElement);
+        div.appendChild(infoDiv);
+        div.appendChild(deleteBtn);
+
+        return div;
+    }
+
+    const onScroll = () => requestAnimationFrame(updateVisibleRange);
+    scrollContainer.addEventListener('scroll', onScroll);
+
+    const resizeObserver = new ResizeObserver(() => {
+        requestAnimationFrame(updateVisibleRange);
     });
+    resizeObserver.observe(container);
+
+    window.addEventListener('resize', onScroll);
+
+    const clickHandler = (e) => {
+        const card = e.target.closest('.image-card');
+        if (!card) return;
+
+        const filename = card.dataset.filename;
+
+        if (e.target.closest('.delete-image-btn')) {
+            e.stopPropagation();
+            if (sessionStorage.getItem('dontAskDelete') === 'true') {
+                handleDeleteImage(filename);
+            } else {
+                showDeleteConfirm(filename);
+            }
+            return;
+        }
+
+        const index = parseInt(card.dataset.index, 10);
+        if (!isNaN(index)) {
+            openModal(index);
+        }
+    };
+    container.addEventListener('click', clickHandler);
+    container._clickHandler = clickHandler;
+
+    container._virtualScrollCleanup = () => {
+        scrollContainer.removeEventListener('scroll', onScroll);
+        resizeObserver.disconnect();
+        window.removeEventListener('resize', onScroll);
+        if (container._clickHandler) {
+            container.removeEventListener('click', container._clickHandler);
+            container._clickHandler = null;
+        }
+    };
+
+    updateVisibleRange();
 }
 
 async function openModal(index) {
@@ -886,6 +1164,7 @@ async function loadModalImage(index) {
     if (!img) return;
 
     modalImg.src = `/api/image/${encodeURIComponent(img.filename)}?t=${Date.now()}`;
+    modalImg.onload = setupZoom;
 
     const captionResp = await fetch('/api/get-caption', {
         method: 'POST',
@@ -894,6 +1173,7 @@ async function loadModalImage(index) {
     });
     const captionData = await captionResp.json();
     currentImageTags = parseTags(captionData.caption);
+    document.getElementById('modalFilename').textContent = img.filename;
 
     await updateInfoBadges(img);
 
@@ -982,6 +1262,16 @@ async function updateInfoBadges(img) {
     infoBadges.innerHTML = badgesHtml;
 }
 
+function updateImageCard(filename, newTagCount) {
+    const card = document.querySelector(`.image-card[data-filename="${filename}"]`);
+    if (card) {
+        const tagCountSpan = card.querySelector('.image-tag-count');
+        if (tagCountSpan) {
+            tagCountSpan.textContent = newTagCount;
+        }
+    }
+}
+
 async function loadVocabulary() {
     if (!currentDatasetPath) return;
     const resp = await fetch(`/api/vocabulary/${encodeURIComponent(currentDatasetPath)}`);
@@ -1042,6 +1332,11 @@ function onCaptionInput(e) {
             await updateInfoBadges(img);
             showSuggestions(newCaption);
             await refreshTagList();
+            const imgObj = currentImagesRaw.find(i => i.filename === img.filename);
+            if (imgObj) {
+                imgObj.tag_count = currentImageTags.length;
+            }
+            updateImageCard(img.filename, currentImageTags.length);
         } catch (err) {
             console.error('Error saving caption:', err);
         }
@@ -1137,7 +1432,17 @@ function toggleTagInCaption(tag) {
     }
 
     if (vocabMode && !vocabEditMode) {
+        const vocabSections = document.getElementById('vocabSections');
+        const scrollPos = vocabSections ? vocabSections.scrollTop : 0;
+
         renderModalContent();
+
+        requestAnimationFrame(() => {
+            const newVocabSections = document.getElementById('vocabSections');
+            if (newVocabSections) {
+                newVocabSections.scrollTop = scrollPos;
+            }
+        });
     }
 }
 
@@ -1152,6 +1457,12 @@ async function saveCaptionWithoutUI(caption) {
         });
         await updateInfoBadges(img);
         await refreshTagList();
+
+        const imgObj = currentImagesRaw.find(i => i.filename === img.filename);
+        if (imgObj) {
+            imgObj.tag_count = currentImageTags.length;
+        }
+        updateImageCard(img.filename, currentImageTags.length);
     } catch (err) {
         console.error('Error saving caption:', err);
     }
@@ -1449,24 +1760,113 @@ async function populateLanguages() {
     refreshCustomSelect('#languageSelect');
 }
 
+let zoomActive = false;
+
+function setupZoom() {
+    const modalImageContainer = document.querySelector('.modal-image');
+    const modalImg = document.getElementById('modalImg');
+
+    if (!modalImageContainer || !modalImg) return;
+
+    modalImageContainer.removeEventListener('mouseenter', onZoomEnter);
+    modalImageContainer.removeEventListener('mousemove', onZoomMove);
+    modalImageContainer.removeEventListener('mouseleave', onZoomLeave);
+
+    if (!zoomEnabled) return;
+
+    modalImageContainer.addEventListener('mouseenter', onZoomEnter);
+    modalImageContainer.addEventListener('mousemove', onZoomMove);
+    modalImageContainer.addEventListener('mouseleave', onZoomLeave);
+}
+
+function onZoomEnter(e) {
+    const container = e.currentTarget;
+    const img = container.querySelector('img');
+    if (!img || !img.complete) return;
+
+    zoomActive = true;
+    container.classList.add('zoomed');
+    updateZoomTransform(e, zoomFactor);
+}
+
+function onZoomMove(e) {
+    if (!zoomActive) return;
+    updateZoomTransform(e, zoomFactor);
+}
+
+function onZoomLeave(e) {
+    zoomActive = false;
+    const container = e.currentTarget;
+    const img = container.querySelector('img');
+    if (img) {
+        img.style.transform = '';
+        img.style.transformOrigin = '';
+    }
+    container.classList.remove('zoomed');
+}
+
+function updateZoomTransform(e, factor) {
+    const container = e.currentTarget;
+    const img = container.querySelector('img');
+    if (!img) return;
+
+    const rect = img.getBoundingClientRect();
+    let x = e.clientX - rect.left;
+    let y = e.clientY - rect.top;
+
+    x = Math.max(0, Math.min(rect.width, x));
+    y = Math.max(0, Math.min(rect.height, y));
+
+    const percentX = (x / rect.width) * 100;
+    const percentY = (y / rect.height) * 100;
+
+    img.style.transformOrigin = `${percentX}% ${percentY}%`;
+    img.style.transform = `scale(${factor})`;
+}
+
 function attachSettingsHandlers() {
     const languageSelect = document.getElementById('languageSelect');
     const colorPicker = document.getElementById('accentColorPicker');
+    const workingDirInput = document.getElementById('workingDirectoryInput');
+    const zoomEnabledCheck = document.getElementById('zoomEnabledCheckbox');
+    const zoomFactorInput = document.getElementById('zoomFactorInput');
 
-    async function saveSettings(lang, color) {
+    (async () => {
+        const resp = await fetch('/api/settings');
+        const settings = await resp.json();
+        if (workingDirInput) {
+            workingDirInput.value = settings.working_directory || '';
+        }
+    })();
+
+    async function saveAllSettings() {
+        const lang = languageSelect.value;
+        const color = colorPicker.value;
+        const wd = workingDirInput ? workingDirInput.value : '';
+        const zoomEnabledVal = zoomEnabledCheck ? zoomEnabledCheck.checked : true;
+        const zoomFactorVal = zoomFactorInput ? parseFloat(zoomFactorInput.value) || 2 : 2;
         await fetch('/api/settings', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ language: lang, accent_color: color })
+            body: JSON.stringify({
+                language: lang,
+                accent_color: color,
+                working_directory: wd,
+                zoom_enabled: zoomEnabledVal,
+                zoom_factor: zoomFactorVal
+            })
         });
+        zoomEnabled = zoomEnabledVal;
+        zoomFactor = zoomFactorVal;
     }
 
     languageSelect.addEventListener('change', async () => {
         const newLang = languageSelect.value;
+        await saveAllSettings();
         currentLanguage = newLang;
-        await loadTranslations(newLang);
-        await saveSettings(newLang, colorPicker.value);
+        await loadTranslations(currentLanguage);
         applyTranslations();
+        initCustomSelects();
     });
 
     colorPicker.addEventListener('input', (e) => {
@@ -1476,11 +1876,18 @@ function attachSettingsHandlers() {
         document.documentElement.style.setProperty('--accent-hover', hoverColor);
         updateGradientVariables(newColor);
     });
+    colorPicker.addEventListener('change', saveAllSettings);
 
-    colorPicker.addEventListener('change', async () => {
-        const newColor = colorPicker.value;
-        await saveSettings(languageSelect.value, newColor);
-    });
+    if (workingDirInput) {
+        workingDirInput.addEventListener('change', saveAllSettings);
+    }
+
+    if (zoomEnabledCheck && zoomFactorInput) {
+        zoomEnabledCheck.checked = zoomEnabled;
+        zoomFactorInput.value = zoomFactor;
+        zoomEnabledCheck.addEventListener('change', saveAllSettings);
+        zoomFactorInput.addEventListener('input', saveAllSettings);
+    }
 
     document.getElementById('resetRatingsBtn')?.addEventListener('click', async () => {
         if (!confirm(t('confirm_reset_ratings') || 'Вы уверены? Все сохранённые рейтинги будут удалены.')) return;
@@ -1583,7 +1990,13 @@ function attachAutoHandlersToMass() {
 
 (async function init() {
     await loadSettings();
-    renderTab('mass');
+    const targetTab = document.querySelector('.tab-button[data-tab="datasets"]');
+    if (targetTab) {
+        document.querySelectorAll('.tab-button').forEach(btn => btn.classList.remove('active'));
+        targetTab.classList.add('active');
+    }
+
+    renderTab('datasets');
 
     fetch('/api/auto-tag/status')
         .then(res => res.json())
