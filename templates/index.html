@@ -11,7 +11,7 @@
 <body>
     <div class="app">
         <header class="header">
-            <div class="path-input-container">
+            <div class="path-input-container" {% if not show_path_input %}style="display: none;"{% endif %}>
                 <input type="text" id="datasetPath" data-i18n-placeholder="dataset_path_placeholder">
                 <button id="loadDatasetBtn" data-i18n="load_dataset">Загрузить</button>
             </div>
@@ -34,13 +34,14 @@
                 <div class="sidebar-toggle" id="sidebarToggle">◀</div>
                 <div class="sidebar-content">
                     <div class="tabs">
+                        <button class="tab-button" data-tab="datasets" data-i18n="datasets">Датасеты</button>
                         <button class="tab-button active" data-tab="mass" data-i18n="mass_edit">Массовое редактирование</button>
                         <button class="tab-button" data-tab="point" data-i18n="point_edit">Точечное редактирование</button>
                         <button class="tab-button" data-tab="analysis" data-i18n="analysis">Анализ датасета</button>
                         <button class="tab-button" data-tab="settings" data-i18n="settings">Настройки</button>
                     </div>
                     <div class="sidebar-footer">
-                        <a href="https://github.com/yourusername/tagforge" target="_blank" class="sidebar-logo-link">
+                        <a href="https://github.com/M0R1C/TagForge" target="_blank" class="sidebar-logo-link">
                             <img src="{{ url_for('static', filename='logo.png') }}" alt="TagForge" class="sidebar-logo">
                         </a>
                     </div>
@@ -63,6 +64,7 @@
                 </div>
             </div>
             <div class="modal-footer">
+                <div class="modal-filename" id="modalFilename"></div>
                 <div class="modal-footer-center">
                     <button id="prevBtn" data-i18n-title="prev">
                         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -88,7 +90,24 @@
             </div>
         </div>
     </div>
+    <div id="deleteConfirmModal" class="modal delete-modal">
+        <div class="modal-content modal-small">
+            <div class="modal-body">
+                <p data-i18n="delete_confirm">Вы уверены, что хотите удалить это изображение?</p>
+                <label class="custom-checkbox">
+                    <input type="checkbox" id="dontAskCheckbox">
+                    <span class="checkmark"></span>
+                    <span data-i18n="dont_ask_again">Больше не спрашивать</span>
+                </label>
+            </div>
+            <div class="modal-footer" style="justify-content: flex-end; gap: 10px;">
+                <button id="confirmDeleteBtn" class="btn-danger" data-i18n="delete">Удалить</button>
+                <button id="cancelDeleteBtn" class="btn-secondary" data-i18n="cancel">Отмена</button>
+            </div>
+        </div>
+    </div>
     <script src="{{ url_for('static', filename='js/widgets.js') }}"></script>
     <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/datasets.js') }}"></script>
 </body>
 </html>
