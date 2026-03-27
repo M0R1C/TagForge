@@ -120,8 +120,14 @@ class AutoTagger:
             for providers in providers_to_try:
                 try:
                     session = ort.InferenceSession(model_path, providers=providers)
-                    used_providers = providers
-                    logger.info(f"Сессия создана с провайдерами: {providers}")
+                    available_providers = session.get_providers()
+                    logger.info(f"Фактически используемые провайдеры: {available_providers}")
+                    if 'DmlExecutionProvider' in available_providers:
+                        logger.info("Используется GPU (DirectML)")
+                    elif 'CUDAExecutionProvider' in available_providers:
+                        logger.info("Используется GPU (CUDA)")
+                    else:
+                        logger.info("Используется CPU")
                     break
                 except Exception as e:
                     logger.debug(f"Не удалось создать сессию с провайдерами {providers}: {e}")
