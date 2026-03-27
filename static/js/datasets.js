@@ -1101,6 +1101,9 @@
                         if (data.error) {
                             alert(data.error);
                         } else {
+                            if (window.currentDatasetPath && data.old_path && window.currentDatasetPath.startsWith(data.old_path)) {
+                                window.resetLoadedDataset();
+                            }
                             btn.closest('.version-item').remove();
                         }
                     });
@@ -1114,6 +1117,10 @@
                         return;
                     }
 
+                    let finalDatasetName = datasetName;
+                    let oldPath = null;
+                    let newPath = null;
+
                     if (newName !== datasetName) {
                         const renameResp = await fetch(`/api/datasets/${encodeURIComponent(datasetName)}/rename_dataset`, {
                             method: 'POST',
@@ -1125,13 +1132,15 @@
                             alert('Ошибка переименования: ' + renameData.error);
                             return;
                         }
-                        datasetName = renameData.new_name;
+                        finalDatasetName = renameData.new_name;
+                        oldPath = renameData.old_path;
+                        newPath = renameData.new_path;
                     }
 
                     if (coverInput.files.length > 0) {
                         const formData = new FormData();
                         formData.append('cover', coverInput.files[0]);
-                        const coverResp = await fetch(`/api/datasets/${encodeURIComponent(datasetName)}/cover`, {
+                        const coverResp = await fetch(`/api/datasets/${encodeURIComponent(finalDatasetName)}/cover`, {
                             method: 'POST',
                             body: formData
                         });
@@ -1140,6 +1149,11 @@
                             alert('Ошибка загрузки обложки: ' + coverData.error);
                             return;
                         }
+                    }
+
+                    if (oldPath && window.currentDatasetPath && window.currentDatasetPath.startsWith(oldPath)) {
+                        const newFullPath = window.currentDatasetPath.replace(oldPath, newPath);
+                        await window.loadDatasetByPath(newFullPath);
                     }
 
                     modal.remove();
@@ -1424,6 +1438,9 @@
         if (data.error) {
             alert(data.error);
         } else {
+            if (window.currentDatasetPath && data.old_path && window.currentDatasetPath.startsWith(data.old_path)) {
+                window.resetLoadedDataset();
+            }
             window.DatasetsTab.showDatasetsList();
         }
     }
@@ -1440,6 +1457,18 @@
                 alert(data.error);
             } else {
                 modal.remove();
+                if (window.currentDatasetPath) {
+                    if (data.old_path && data.new_path) {
+                        if (window.currentDatasetPath.startsWith(data.old_path)) {
+                            const newFullPath = window.currentDatasetPath.replace(data.old_path, data.new_path);
+                            window.loadDatasetByPath(newFullPath);
+                        } else if (data.affected_path === window.currentDatasetPath) {
+                            if (typeof window.loadTagsAndImages === 'function') window.loadTagsAndImages();
+                            if (typeof window.refreshTagList === 'function') window.refreshTagList();
+                            if (typeof window.reloadDuplicateData === 'function') window.reloadDuplicateData();
+                        }
+                    }
+                }
                 window.DatasetsTab.browse();
             }
         })
@@ -1458,6 +1487,15 @@
                 alert(data.error);
             } else {
                 if (modal) modal.remove();
+                if (window.currentDatasetPath && data.old_path) {
+                    if (window.currentDatasetPath.startsWith(data.old_path)) {
+                        window.resetLoadedDataset();
+                    } else if (data.affected_path === window.currentDatasetPath) {
+                        if (typeof window.loadTagsAndImages === 'function') window.loadTagsAndImages();
+                        if (typeof window.refreshTagList === 'function') window.refreshTagList();
+                        if (typeof window.reloadDuplicateData === 'function') window.reloadDuplicateData();
+                    }
+                }
                 window.DatasetsTab.browse();
             }
         })
