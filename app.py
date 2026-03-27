@@ -1129,6 +1129,70 @@ def create_dataset_version(dataset_name):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+def update_run_bat(host, port):
+    if not host:
+        host = '127.0.0.1'
+    if not port:
+        port = 5000
+    else:
+        port = int(port)
+
+    browser_host = '127.0.0.1' if host == '0.0.0.0' else host
+    url = f"http://{browser_host}:{port}"
+
+    bat_path = os.path.join(BASE_DIR, 'run.bat')
+    template_lines = [
+        '@echo off\n',
+        'chcp 65001 >nul\n',
+        'echo Launching TagForge...\n',
+        'echo.\n',
+        'call "%~dp0venv\\Scripts\\activate.bat"\n',
+        'if errorlevel 1 (\n',
+        '    echo [ERROR] The environment could not be activated.\n',
+        '    pause\n',
+        '    exit /b 1\n',
+        ')\n',
+        'echo Opening browser...\n',
+        f'start /b "" cmd /c "start {url}"\n',
+        'python app.py\n',
+        'if errorlevel 1 (\n',
+        '    echo.\n',
+        '    echo [ERROR] The program has terminated with an error.\n',
+        '    pause\n',
+        ')\n',
+        'deactivate\n'
+    ]
+
+    try:
+        if os.path.exists(bat_path):
+            with open(bat_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+        else:
+            lines = template_lines
+
+        replaced = False
+        for i, line in enumerate(lines):
+            if 'start /b "" cmd /c "start' in line:
+                lines[i] = f'start /b "" cmd /c "start {url}"\n'
+                replaced = True
+                break
+        if not replaced:
+            for i, line in enumerate(lines):
+                if line.strip().startswith('python app.py'):
+                    lines.insert(i, f'start /b "" cmd /c "start {url}"\n')
+                    replaced = True
+                    break
+            if not replaced:
+                lines.append(f'start /b "" cmd /c "start {url}"\n')
+
+        with open(bat_path, 'w', encoding='utf-8') as f:
+            f.writelines(lines)
+
+        app.logger.info(f"run.bat updated with URL: {url}")
+    except Exception as e:
+        app.logger.error(f"Failed to update run.bat: {e}")
+        raise
+
 @app.route('/api/datasets/<path:dataset_name>/versions', methods=['GET'])
 def dataset_versions(dataset_name):
     wd = get_working_directory()
@@ -1618,6 +1682,10 @@ def save_settings():
     zoom_factor = data.get('zoom_factor')
     server_host = data.get('server_host')
     server_port = data.get('server_port')
+
+    old_host = get_setting('server_host', '')
+    old_port = get_setting('server_port', '')
+
     if lang:
         set_setting('language', lang)
     if color:
@@ -1632,6 +1700,18 @@ def save_settings():
         set_setting('server_host', server_host)
     if server_port is not None:
         set_setting('server_port', server_port)
+
+    host_changed = server_host is not None and server_host != old_host
+    port_changed = server_port is not None and server_port != old_port
+    if host_changed or port_changed:
+        new_host = server_host if server_host is not None else old_host
+        new_port = server_port if server_port is not None else old_port
+        try:
+            update_run_bat(new_host, new_port)
+        except Exception as e:
+            app.logger.error(f"Failed to update run.bat: {e}")
+            return jsonify({'success': True, 'warning': f'Настройки сохранены, но не удалось обновить run.bat: {e}'})
+
     return jsonify({'success': True})
 
 @app.route('/api/delete-image', methods=['POST'])
