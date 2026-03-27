@@ -94,6 +94,13 @@ function initCustomSelects() {
 
 document.addEventListener('DOMContentLoaded', initCustomSelects);
 
+function versionCompare(a, b) {
+    const aParts = a.replace('v', '').split('_').map(Number);
+    const bParts = b.replace('v', '').split('_').map(Number);
+    if (aParts[0] !== bParts[0]) return aParts[0] - bParts[0];
+    return aParts[1] - bParts[1];
+}
+
 function refreshCustomSelect(selector) {
     const select = document.querySelector(selector);
     if (!select) return;
@@ -499,6 +506,9 @@ function renderWidgetContent(container, type, options) {
         case 'stats':
             renderStats(container);
             break;
+        case 'versionCompare':
+            renderVersionCompareWidget(container, options);
+            break;
         default:
             container.innerHTML = `<p>${t('unknown_widget')}</p>`;
     }
@@ -712,7 +722,8 @@ function getDefaultTitle(type) {
         topTags: t('widget_title_top_tags'),
         resolution: t('widget_title_resolution'),
         tagHistogram: t('widget_title_tag_histogram'),
-        stats: t('widget_title_stats')
+        stats: t('widget_title_stats'),
+        versionCompare: t('widget_title_version_compare') || 'Сравнение версий'
     };
     return titles[type] || 'Widget';
 }
@@ -785,15 +796,78 @@ function openAddWidgetModal() {
                         <option value="resolution">${t('widget_title_resolution')}</option>
                         <option value="tagHistogram">${t('widget_title_tag_histogram')}</option>
                         <option value="stats">${t('widget_title_stats')}</option>
+                        <option value="versionCompare">${t('widget_title_version_compare') || 'Сравнение версий'}</option>
                     </select>
                 </div>
-                <div class="form-group" id="widgetParamGroup" style="display: none;">
-                    <label for="widgetParam">${t('widget_param')}</label>
-                    <input type="number" id="widgetParam" value="10" min="1" max="50">
+
+                <!-- Специальная секция для versionCompare -->
+                <div id="versionCompareConfig" style="display: none;">
+                    <div class="version-compare-layout">
+                        <div class="left-column">
+                            <div class="form-group">
+                                <label>${t('dataset')}</label>
+                                <select id="compareDatasetSelect" class="custom-select"></select>
+                            </div>
+                        </div>
+                        <div class="right-column">
+                            <div class="right-column-inner">
+                                <div class="form-group">
+                                    <label>${t('version_first')}</label>
+                                    <select id="compareVersion1Select" class="custom-select"></select>
+                                </div>
+                                <div class="form-group">
+                                    <label>${t('version_second')}</label>
+                                    <select id="compareVersion2Select" class="custom-select"></select>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label>${t('metrics')}</label>
+                        <div id="compareMetricsGroup" class="metrics-checkboxes">
+                            <label class="custom-checkbox">
+                                <input type="checkbox" value="total_images">
+                                <span class="checkmark"></span>
+                                <span>${t('total_images')}</span>
+                            </label>
+                            <label class="custom-checkbox">
+                                <input type="checkbox" value="multiple_32">
+                                <span class="checkmark"></span>
+                                <span>${t('multiple_32')}</span>
+                            </label>
+                            <label class="custom-checkbox">
+                                <input type="checkbox" value="multiple_64">
+                                <span class="checkmark"></span>
+                                <span>${t('multiple_64')}</span>
+                            </label>
+                            <label class="custom-checkbox">
+                                <input type="checkbox" value="avg_tags_per_image">
+                                <span class="checkmark"></span>
+                                <span>${t('avg_tags_per_image')}</span>
+                            </label>
+                            <label class="custom-checkbox">
+                                <input type="checkbox" value="unique_tags">
+                                <span class="checkmark"></span>
+                                <span>${t('unique_tags')}</span>
+                            </label>
+                            <label class="custom-checkbox">
+                                <input type="checkbox" value="duplicates">
+                                <span class="checkmark"></span>
+                                <span>${t('duplicates')}</span>
+                            </label>
+                            <label class="custom-checkbox">
+                                <input type="checkbox" value="avg_overall_quality">
+                                <span class="checkmark"></span>
+                                <span>${t('avg_overall_quality')}</span>
+                            </label>
+                        </div>
+                    </div>
+                    <div id="qualityWarning" style="display: none; color: #f59e0b; font-size: 13px; margin-top: 8px;"></div>
                 </div>
+
                 <div class="form-actions">
-                    <button class="btn btn-secondary" id="cancelAddWidget">${t('cancel')}</button>
-                    <button class="btn btn-primary" id="confirmAddWidget">${t('add')}</button>
+                    <button class="btn-secondary" id="cancelAddWidget">${t('cancel')}</button>
+                    <button class="btn-primary" id="confirmAddWidget">${t('add')}</button>
                 </div>
             </div>
         </div>
@@ -803,27 +877,130 @@ function openAddWidgetModal() {
     initCustomSelects();
 
     const typeSelect = addModal.querySelector('#widgetType');
-    const paramGroup = addModal.querySelector('#widgetParamGroup');
-    typeSelect.addEventListener('change', () => {
-        paramGroup.style.display = typeSelect.value === 'topTags' ? 'block' : 'none';
-    });
+    const versionCompareConfig = addModal.querySelector('#versionCompareConfig');
+    const confirmBtn = addModal.querySelector('#confirmAddWidget');
+    const cancelBtn = addModal.querySelector('#cancelAddWidget');
+    const qualityWarning = addModal.querySelector('#qualityWarning');
+    const datasetSelect = addModal.querySelector('#compareDatasetSelect');
+    const version1Select = addModal.querySelector('#compareVersion1Select');
+    const version2Select = addModal.querySelector('#compareVersion2Select');
+    const metricsCheckboxes = addModal.querySelectorAll('#compareMetricsGroup input');
 
-    addModal.addEventListener('click', (e) => {
-        if (e.target === addModal) closeAddModal();
-    });
+    let currentDataset = null;
+    let versionsData = {};
 
-    document.getElementById('cancelAddWidget').addEventListener('click', closeAddModal);
-    document.getElementById('confirmAddWidget').addEventListener('click', () => {
-        const type = typeSelect.value;
-        const options = { title: typeSelect.options[typeSelect.selectedIndex].text };
-        if (type === 'topTags') {
-            options.limit = parseInt(document.getElementById('widgetParam').value, 10) || 10;
+    async function checkQualityData(datasetName, version) {
+        const resp = await fetch(`/api/version-quality-check?dataset=${encodeURIComponent(datasetName)}&version=${encodeURIComponent(version)}`);
+        const data = await resp.json();
+        return data.has_data;
+    }
+
+    async function updateWarningAndButton() {
+        if (typeSelect.value !== 'versionCompare') return;
+
+        const version1 = version1Select.value;
+        const version2 = version2Select.value;
+        const avgQualityChecked = Array.from(metricsCheckboxes).some(cb => cb.value === 'avg_overall_quality' && cb.checked);
+
+        if (!avgQualityChecked) {
+            qualityWarning.style.display = 'none';
+            confirmBtn.disabled = false;
+            return;
         }
-        addWidget(type, options);
-        closeAddModal();
+
+        if (!version1 || !version2 || !currentDataset) {
+            qualityWarning.style.display = 'none';
+            confirmBtn.disabled = false;
+            return;
+        }
+
+        async function checkQualityData(dataset, version) {
+            const resp = await fetch(`/api/version-quality-check?dataset=${encodeURIComponent(dataset)}&version=${encodeURIComponent(version)}`);
+            const data = await resp.json();
+            return data.has_data;
+        }
+
+        const [hasData1, hasData2] = await Promise.all([
+            checkQualityData(currentDataset, version1),
+            checkQualityData(currentDataset, version2)
+        ]);
+
+        const missingVersions = [];
+        if (!hasData1) missingVersions.push(version1.replace('_', '.'));
+        if (!hasData2) missingVersions.push(version2.replace('_', '.'));
+
+        if (missingVersions.length > 0) {
+            qualityWarning.style.display = 'block';
+            qualityWarning.innerHTML = t('quality_data_missing_warning') + ': ' + missingVersions.join(', ');
+            confirmBtn.disabled = true;
+        } else {
+            qualityWarning.style.display = 'none';
+            confirmBtn.disabled = false;
+        }
+    }
+
+    function refreshSelect(selectElement) {
+        const container = selectElement.parentElement?.querySelector('.custom-select-container');
+        if (container) container.remove();
+        selectElement.removeAttribute('data-customized');
+        initCustomSelects();
+    }
+
+    async function loadDatasets() {
+        const resp = await fetch('/api/datasets');
+        const datasets = await resp.json();
+        datasetSelect.innerHTML = '';
+        datasets.forEach(ds => {
+            const option = document.createElement('option');
+            option.value = ds.name;
+            option.textContent = ds.name;
+            datasetSelect.appendChild(option);
+        });
+        if (datasets.length) {
+            currentDataset = datasets[0].name;
+            await loadVersions(currentDataset);
+        }
+        refreshSelect(datasetSelect);
+        datasetSelect.addEventListener('change', async () => {
+            currentDataset = datasetSelect.value;
+            await loadVersions(currentDataset);
+            await updateWarningAndButton();
+        });
+    }
+
+    async function loadVersions(datasetName) {
+        const resp = await fetch(`/api/datasets/${encodeURIComponent(datasetName)}/versions`);
+        const versions = await resp.json();
+        versionsData = versions;
+        const versionNames = Object.keys(versions).sort((a, b) => versionCompare(b, a));
+        [version1Select, version2Select].forEach(select => {
+            select.innerHTML = '';
+            versionNames.forEach(ver => {
+                const option = document.createElement('option');
+                option.value = ver;
+                option.textContent = ver.replace('_', '.');
+                select.appendChild(option);
+            });
+            refreshSelect(select);
+        });
+        await updateWarningAndButton();
+    }
+
+    metricsCheckboxes.forEach(cb => {
+        cb.addEventListener('change', updateWarningAndButton);
     });
 
-    addModal.classList.add('show');
+    version1Select.addEventListener('change', updateWarningAndButton);
+    version2Select.addEventListener('change', updateWarningAndButton);
+
+    typeSelect.addEventListener('change', () => {
+        versionCompareConfig.style.display = typeSelect.value === 'versionCompare' ? 'block' : 'none';
+        if (typeSelect.value === 'versionCompare') {
+            loadDatasets();
+        } else {
+            confirmBtn.disabled = false;
+        }
+    });
 
     function closeAddModal() {
         addModal.classList.remove('show');
@@ -831,4 +1008,205 @@ function openAddWidgetModal() {
             if (addModal && addModal.parentNode) addModal.remove();
         }, 300);
     }
+
+    cancelBtn.addEventListener('click', closeAddModal);
+    confirmBtn.addEventListener('click', () => {
+        const type = typeSelect.value;
+        let options = { title: typeSelect.options[typeSelect.selectedIndex].text };
+
+        if (type === 'versionCompare') {
+            const dataset = datasetSelect.value;
+            const version1 = version1Select.value;
+            const version2 = version2Select.value;
+            const metrics = Array.from(metricsCheckboxes).filter(cb => cb.checked).map(cb => cb.value);
+            if (!dataset || !version1 || !version2) {
+                alert(t('select_dataset_and_versions'));
+                return;
+            }
+            if (metrics.length === 0) {
+                alert(t('select_at_least_one_metric'));
+                return;
+            }
+            options = { ...options, dataset, version1, version2, metrics };
+        } else if (type === 'topTags') {
+            const limit = parseInt(addModal.querySelector('#widgetParam')?.value, 10) || 10;
+            options.limit = limit;
+        }
+
+        addWidget(type, options);
+        closeAddModal();
+    });
+
+    addModal.addEventListener('click', (e) => {
+        if (e.target === addModal) closeAddModal();
+    });
+
+    addModal.classList.add('show');
+}
+
+function renderVersionCompareWidget(container, options) {
+    container.innerHTML = '';
+    const canvas = document.createElement('canvas');
+    container.appendChild(canvas);
+    canvas.id = `chart_${Date.now()}`;
+
+    const widgetId = container.closest('.widget-item').id;
+
+    if (!options.dataset || !options.version1 || !options.version2 || !options.metrics) {
+        container.innerHTML = `<p style="color: #888; text-align: center;">${t('no_compare_params')}</p>`;
+        return;
+    }
+
+    const url = `/api/version-stats?dataset=${encodeURIComponent(options.dataset)}&versions=${encodeURIComponent(options.version1)}&versions=${encodeURIComponent(options.version2)}`;
+    fetch(url)
+        .then(res => res.json())
+        .then(statsData => {
+            for (let ver of [options.version1, options.version2]) {
+                if (statsData[ver] && statsData[ver].error) {
+                    container.innerHTML = `<p style="color: #ef4444;">${statsData[ver].error}</p>`;
+                    return;
+                }
+            }
+
+            const metricsLabels = {
+                total_images: t('total_images'),
+                multiple_32: t('multiple_32'),
+                multiple_64: t('multiple_64'),
+                avg_tags_per_image: t('avg_tags_per_image'),
+                unique_tags: t('unique_tags'),
+                duplicates: t('duplicates'),
+                avg_overall_quality: t('avg_overall_quality')
+            };
+
+            const labels = options.metrics.map(m => metricsLabels[m] || m);
+            const datasets = [
+                {
+                    label: options.version1.replace('_', '.'),
+                    data: options.metrics.map(m => statsData[options.version1][m]),
+                    backgroundColor: 'rgba(59, 130, 246, 0.6)',
+                    borderColor: 'rgba(59, 130, 246, 1)',
+                    borderWidth: 1
+                },
+                {
+                    label: options.version2.replace('_', '.'),
+                    data: options.metrics.map(m => statsData[options.version2][m]),
+                    backgroundColor: 'rgba(139, 92, 246, 0.6)',
+                    borderColor: 'rgba(139, 92, 246, 1)',
+                    borderWidth: 1
+                }
+            ];
+
+            const ctx = canvas.getContext('2d');
+            const chart = new Chart(ctx, {
+                type: 'bar',
+                data: { labels, datasets },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { position: 'top', labels: { color: '#e0e0e0' } },
+                        tooltip: { callbacks: { label: (ctx) => `${ctx.dataset.label}: ${ctx.raw}` } }
+                    },
+                    scales: {
+                        y: { ticks: { color: '#a0a0a0' } },
+                        x: { ticks: { color: '#a0a0a0' } }
+                    }
+                }
+            });
+
+            window.widgetCharts.set(widgetId, chart);
+        })
+        .catch(err => {
+            console.error(err);
+            container.innerHTML = `<p style="color: #ef4444;">${t('error_loading_stats')}</p>`;
+        });
+}
+
+function loadVersionsForDataset(dataset, container, options) {
+    fetch(`/api/datasets/${encodeURIComponent(dataset)}/versions`)
+        .then(res => res.json())
+        .then(versions => {
+            const versionsSelect = container.querySelector('#compareVersionsSelect');
+            versionsSelect.innerHTML = '';
+            const versionNames = Object.keys(versions).sort((a, b) => versionCompare(b, a));
+            versionNames.forEach(ver => {
+                const option = document.createElement('option');
+                option.value = ver;
+                option.textContent = ver.replace('_', '.');
+                if (options.versions && options.versions.includes(ver)) option.selected = true;
+                versionsSelect.appendChild(option);
+            });
+        });
+}
+
+function loadAndRenderVersionChart(container, widgetId, options) {
+    const canvas = container.querySelector('#compareChartCanvas');
+    if (!canvas) return;
+
+    if (window.widgetCharts.has(widgetId)) {
+        window.widgetCharts.get(widgetId).destroy();
+        window.widgetCharts.delete(widgetId);
+    }
+
+    const { dataset, versions, metrics } = options;
+    if (!dataset || !versions || !metrics) return;
+
+    const url = `/api/version-stats?dataset=${encodeURIComponent(dataset)}&` + versions.map(v => `versions=${encodeURIComponent(v)}`).join('&');
+    fetch(url)
+        .then(res => res.json())
+        .then(statsData => {
+            for (let ver of versions) {
+                if (statsData[ver] && statsData[ver].error) {
+                    alert(`Ошибка для версии ${ver}: ${statsData[ver].error}`);
+                    return;
+                }
+            }
+
+            const labels = metrics.map(m => {
+                switch (m) {
+                    case 'total_images': return 'Всего изображений';
+                    case 'multiple_32': return 'Кратно 32';
+                    case 'multiple_64': return 'Кратно 64';
+                    case 'avg_tags_per_image': return 'Среднее тегов';
+                    case 'unique_tags': return 'Уникальных тегов';
+                    case 'duplicates': return 'Дубликаты';
+                    default: return m;
+                }
+            });
+
+            const datasets = versions.map((ver, idx) => {
+                const data = metrics.map(m => statsData[ver][m]);
+                return {
+                    label: ver.replace('_', '.'),
+                    data: data,
+                    backgroundColor: `hsl(${idx * 120}, 70%, 50%)`,
+                    borderColor: `hsl(${idx * 120}, 70%, 40%)`,
+                    borderWidth: 1
+                };
+            });
+
+            const ctx = canvas.getContext('2d');
+            const chart = new Chart(ctx, {
+                type: 'bar',
+                data: { labels, datasets },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { position: 'top', labels: { color: '#e0e0e0' } },
+                        tooltip: { callbacks: { label: (ctx) => `${ctx.dataset.label}: ${ctx.raw}` } }
+                    },
+                    scales: {
+                        y: { ticks: { color: '#a0a0a0' } },
+                        x: { ticks: { color: '#a0a0a0' } }
+                    }
+                }
+            });
+
+            window.widgetCharts.set(widgetId, chart);
+        })
+        .catch(err => {
+            console.error(err);
+            alert('Ошибка загрузки статистики');
+        });
 }
