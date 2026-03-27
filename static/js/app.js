@@ -1,5 +1,6 @@
 let currentDatasetPath = '';
 let currentDatasetName = '';
+window.currentDatasetPath = currentDatasetPath;
 let currentImages = [];
 let currentSettings = {};
 let currentTags = [];
@@ -14,6 +15,8 @@ let backupActive = false;
 let backupInterval = null;
 let vocabOrder = [];
 let zoomEnabled = true;
+let analyzeActive = false;
+let analyzeInterval = null;
 let zoomFactor = 2;
 let pendingDeleteFilename = null;
 
@@ -27,7 +30,8 @@ let filters = {
     aspects: [],
     multiple32: false,
     multiple64: false,
-    multipleNot: false
+    multipleNot: false,
+    duplicates: false
 };
 let filterPanelVisible = false;
 let filterDebounceTimer = null;
@@ -44,6 +48,12 @@ let currentImageTags = [];
 
 function t(key) {
     return translations[key] || key;
+}
+
+function isValidIP(ip) {
+    if (ip === 'localhost' || ip === '0.0.0.0') return true;
+    const ipRegex = /^(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
+    return ipRegex.test(ip);
 }
 
 
@@ -119,6 +129,91 @@ function getColumnCount(containerWidth) {
     const gap = 20;
     let columns = Math.floor((containerWidth + gap) / (minWidth + gap));
     return Math.max(1, columns);
+}
+
+function startAnalyzePolling() {
+    if (analyzeInterval) return;
+    analyzeInterval = setInterval(async () => {
+        const resp = await fetch('/api/analyze/status');
+        const status = await resp.json();
+        updateAnalyzeProgress(status);
+        if (!status.running) {
+            analyzeActive = false;
+            stopAnalyzePolling();
+            updateAnalyzeButtons();
+            handleAnalyzeComplete();
+        } else {
+            analyzeActive = true;
+        }
+    }, 300);
+}
+
+function stopAnalyzePolling() {
+    if (analyzeInterval) {
+        clearInterval(analyzeInterval);
+        analyzeInterval = null;
+    }
+}
+
+function updateAnalyzeProgress(status) {
+    const container = document.getElementById('analyzeProgressContainer');
+    const fill = document.getElementById('analyzeProgressFill');
+    const current = document.getElementById('analyzeCurrentFile');
+    if (container) {
+        if (status.total > 0) {
+            const percent = (status.processed / status.total) * 100;
+            fill.style.width = percent + '%';
+            current.textContent = status.current_file || t('idle');
+        }
+        container.style.display = status.running ? 'block' : 'none';
+    }
+
+    const overlayFill = document.getElementById('analyzeOverlayProgressFill');
+    const overlayPercent = document.getElementById('analyzeOverlayPercent');
+    const overlayCurrent = document.getElementById('analyzeOverlayCurrentFile');
+    if (overlayFill && overlayPercent && overlayCurrent) {
+        if (status.total > 0) {
+            const percent = (status.processed / status.total) * 100;
+            overlayFill.style.width = percent + '%';
+            overlayPercent.textContent = Math.round(percent) + '%';
+            overlayCurrent.textContent = status.current_file || '';
+        }
+    }
+}
+
+function showAnalyzeOverlay(show) {
+    const overlay = document.getElementById('analyzeOverlay');
+    const gridContainer = document.querySelector('.image-grid-container');
+    const tagContainer = document.querySelector('.tag-list-container');
+    if (!overlay) return;
+    if (show) {
+        overlay.style.display = 'flex';
+        if (gridContainer) gridContainer.style.display = 'none';
+        if (tagContainer) tagContainer.style.display = 'none';
+    } else {
+        overlay.style.display = 'none';
+        if (gridContainer) gridContainer.style.display = '';
+        if (tagContainer) tagContainer.style.display = '';
+    }
+}
+
+async function handleAnalyzeComplete() {
+    analyzeActive = false;
+    stopAnalyzePolling();
+    updateAnalyzeButtons();
+    await reloadDuplicateData();
+    const activeTab = document.querySelector('.tab-button.active').dataset.tab;
+    if (activeTab === 'point' && currentDatasetPath) {
+        showAnalyzeOverlay(false);
+        loadTagsAndImages();
+    }
+}
+
+function updateAnalyzeButtons() {
+    const startBtn = document.getElementById('startAnalyzeBtn');
+    const stopBtn = document.getElementById('stopAnalyzeBtn');
+    if (startBtn) startBtn.disabled = analyzeActive;
+    if (stopBtn) stopBtn.disabled = !analyzeActive;
 }
 
 function getItemPosition(index, columns, rowHeight, gap, containerWidth) {
@@ -241,6 +336,63 @@ function updateBackupButtonsUI() {
     const backupBtn = document.getElementById('backupBtn');
     if (backupBtn) backupBtn.disabled = backupActive;
 }
+
+window.resetLoadedDataset = function() {
+    currentDatasetPath = '';
+    window.currentDatasetPath = '';
+    currentImages = [];
+    currentImagesRaw = [];
+
+    const pathInput = document.getElementById('datasetPath');
+    if (pathInput) pathInput.value = '';
+
+    const countSpan = document.getElementById('imageCount');
+    if (countSpan) countSpan.textContent = '0';
+
+    const grid = document.getElementById('imageGrid');
+    if (grid) grid.innerHTML = '';
+
+    const tagList = document.getElementById('tagList');
+    if (tagList) tagList.innerHTML = '';
+
+    const analysisPanel = document.querySelector('.analysis-panel');
+    if (analysisPanel) {
+        analysisPanel.innerHTML = `<p style="color: #888; text-align: center;">${t('no_dataset')}</p>`;
+    }
+};
+
+window.loadDatasetByPath = async function(path) {
+    if (!path) return;
+    const response = await fetch('/api/load-dataset', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path })
+    });
+    const data = await response.json();
+    if (data.error) {
+        alert(data.error);
+        return;
+    }
+    currentDatasetPath = path;
+    window.currentDatasetPath = path;
+    const pathInput = document.getElementById('datasetPath');
+    if (pathInput) pathInput.value = path;
+    const countSpan = document.getElementById('imageCount');
+    if (countSpan) countSpan.textContent = data.count;
+    startRatingPolling();
+
+    const similarResp = await fetch('/api/similar-pairs');
+    window.similarPairs = similarResp.ok ? await similarResp.json() : [];
+    const duplicateGroupsResp = await fetch('/api/duplicates');
+    window.duplicateGroups = duplicateGroupsResp.ok ? await duplicateGroupsResp.json() : [];
+
+    const activeTab = document.querySelector('.tab-button.active').dataset.tab;
+    if (activeTab === 'point') {
+        renderTab('point');
+    } else if (activeTab === 'analysis') {
+        renderTab('analysis');
+    }
+};
 
 async function loadSettings() {
     const resp = await fetch('/api/settings');
@@ -418,13 +570,25 @@ function renderTab(tabName) {
                 renderTagList(allTagsCounter);
             });
         }
+        attachFilterHandlers();
         if (currentDatasetPath) {
-            loadTagsAndImages();
+            fetch('/api/analyze/status')
+                .then(res => res.json())
+                .then(status => {
+                    if (status.running) {
+                        analyzeActive = true;
+                        showAnalyzeOverlay(true);
+                        startAnalyzePolling();
+                        updateAnalyzeProgress(status);
+                    } else {
+                        showAnalyzeOverlay(false);
+                        loadTagsAndImages();
+                    }
+                });
         } else {
             if (imageGrid) imageGrid.innerHTML = `<p style="color: #888; text-align: center;">${t('no_dataset')}</p>`;
         }
         stopAutoStatusPolling();
-        attachFilterHandlers();
     } else if (tabName === 'datasets') {
         mainContent.innerHTML = `<div id="datasetsContainer"></div>`;
         if (window.DatasetsTab) {
@@ -579,6 +743,15 @@ function getPointHTML() {
                         </label>
                     </div>
 
+                    <div class="filter-section">
+                        <h4 data-i18n="duplicates">Дубликаты</h4>
+                        <label class="custom-checkbox">
+                            <input type="checkbox" id="filterDuplicates" class="filter-duplicates">
+                            <span class="checkmark"></span>
+                            <span data-i18n="show_duplicates_only">Показывать только дубликаты</span>
+                        </label>
+                    </div>
+
                     <!-- Разрешение -->
                     <div class="filter-section">
                         <h4 data-i18n="resolution">Разрешение</h4>
@@ -642,6 +815,19 @@ function getPointHTML() {
                 <input type="text" id="tagSearch" data-i18n-placeholder="search_tags">
                 <div id="tagList" class="tag-list"></div>
             </div>
+            <!-- Оверлей загрузки анализа -->
+            <div id="analyzeOverlay" class="analyze-overlay" style="display: none;">
+                <div class="analyze-content">
+                    <div class="analyze-spinner"></div>
+                    <div class="analyze-progress">
+                        <div class="progress-bar-large">
+                            <div id="analyzeOverlayProgressFill" style="width:0%"></div>
+                        </div>
+                        <span id="analyzeOverlayPercent">0%</span>
+                    </div>
+                    <span id="analyzeOverlayCurrentFile"></span>
+                </div>
+            </div>
         </div>
     `;
 }
@@ -671,6 +857,16 @@ function getSettingsHTML() {
             <h3 data-i18n="working_directory">Рабочая директория</h3>
             <input type="text" id="workingDirectoryInput" placeholder="/path/to/workspace" value="">
 
+            <h3 data-i18n="server_settings">Настройки сервера</h3>
+            <div class="form-group">
+                <label data-i18n="server_host">IP-адрес (по умолчанию 127.0.0.1)</label>
+                <input type="text" id="serverHostInput" placeholder="127.0.0.1" value="">
+            </div>
+            <div class="form-group">
+                <label data-i18n="server_port">Порт (по умолчанию 5000)</label>
+                <input type="text" id="serverPortInput" placeholder="5000" value="">
+            </div>
+
             <h3 data-i18n="zoom_settings">Настройки лупы</h3>
             <div class="form-group">
                 <label class="custom-checkbox">
@@ -684,7 +880,6 @@ function getSettingsHTML() {
                 <input type="number" id="zoomFactorInput" min="1" max="5" step="0.5" value="2">
             </div>
 
-            <!-- Разделитель перед опасной кнопкой -->
             <hr style="margin: 24px 0; border: 1px solid var(--border-color);">
 
             <h3 data-i18n="reset_ratings_title">Сброс возрастных рейтингов</h3>
@@ -700,28 +895,19 @@ function getSettingsHTML() {
 loadBtn.addEventListener('click', async () => {
     const path = datasetPathInput.value.trim();
     if (!path) return;
-    const response = await fetch('/api/load-dataset', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path })
-    });
-    const data = await response.json();
-    if (data.error) {
-        alert(data.error);
-        return;
-    }
-    currentDatasetPath = path;
-    currentDatasetName = path.split(/[\\/]/).pop();
-    imageCountSpan.textContent = data.count;
-    startRatingPolling();
-
-    const activeTab = document.querySelector('.tab-button.active').dataset.tab;
-    if (activeTab === 'point') {
-        renderTab('point');
-    } else if (activeTab === 'analysis') {
-        renderTab('analysis');
-    }
+    window.loadDatasetByPath(path);
 });
+
+async function reloadDuplicateData() {
+    try {
+        const similarResp = await fetch('/api/similar-pairs');
+        if (similarResp.ok) window.similarPairs = await similarResp.json();
+        const duplicateResp = await fetch('/api/duplicates');
+        if (duplicateResp.ok) window.duplicateGroups = await duplicateResp.json();
+    } catch (e) {
+        console.error('Ошибка загрузки данных о дубликатах:', e);
+    }
+}
 
 async function refreshTagList() {
     if (!currentDatasetPath) return;
@@ -766,7 +952,13 @@ function attachFilterHandlers() {
     const maxH = document.getElementById('filterMaxH');
     const aspectButtons = document.querySelectorAll('.aspect-btn');
     const multipleCheckboxes = document.querySelectorAll('.filter-multiple');
+    const duplicateCheckbox = document.getElementById('filterDuplicates');
     const resetBtn = document.getElementById('resetFiltersBtn');
+
+    if (duplicateCheckbox) {
+        duplicateCheckbox.checked = filters.duplicates || false;
+        duplicateCheckbox.addEventListener('change', collectAndApply);
+    }
 
     function collectAndApply() {
         filters.ratings = Array.from(ratingCheckboxes)
@@ -789,6 +981,10 @@ function attachFilterHandlers() {
         filters.multiple32 = !!mult32;
         filters.multiple64 = !!mult64;
         filters.multipleNot = !!multNot;
+
+        if (duplicateCheckbox) {
+            filters.duplicates = duplicateCheckbox.checked;
+        }
 
         applyFilters();
     }
@@ -825,6 +1021,7 @@ function attachFilterHandlers() {
 
         aspectButtons.forEach(btn => btn.classList.remove('selected'));
         multipleCheckboxes.forEach(cb => cb.checked = false);
+        if (duplicateCheckbox) duplicateCheckbox.checked = false;
 
         filters = {
             ratings: [],
@@ -835,11 +1032,104 @@ function attachFilterHandlers() {
             aspects: [],
             multiple32: false,
             multiple64: false,
-            multipleNot: false
+            multipleNot: false,
+            duplicates: false
         };
 
         applyFilters();
     });
+}
+
+function buildDuplicateComponents(images, similarPairs, duplicateGroups) {
+    const filenames = images.map(img => img.filename);
+    const filenameSet = new Set(filenames);
+    const graph = {};
+
+    const addEdge = (a, b) => {
+        if (!graph[a]) graph[a] = [];
+        if (!graph[b]) graph[b] = [];
+        if (!graph[a].includes(b)) graph[a].push(b);
+        if (!graph[b].includes(a)) graph[b].push(a);
+    };
+
+    similarPairs.forEach(p => {
+        if (filenameSet.has(p.filename1) && filenameSet.has(p.filename2)) {
+            addEdge(p.filename1, p.filename2);
+        }
+    });
+
+    duplicateGroups.forEach(group => {
+        const files = group.files.filter(f => filenameSet.has(f));
+        for (let i = 0; i < files.length; i++) {
+            for (let j = i + 1; j < files.length; j++) {
+                addEdge(files[i], files[j]);
+            }
+        }
+    });
+
+    const visited = new Set();
+    const components = [];
+
+    for (let f of filenames) {
+        if (!visited.has(f) && graph[f]) {
+            const stack = [f];
+            const component = [];
+            while (stack.length) {
+                const node = stack.pop();
+                if (visited.has(node)) continue;
+                visited.add(node);
+                component.push(node);
+                if (graph[node]) {
+                    for (let neighbor of graph[node]) {
+                        if (!visited.has(neighbor)) {
+                            stack.push(neighbor);
+                        }
+                    }
+                }
+            }
+            components.push(component);
+        }
+    }
+
+    return components;
+}
+
+function buildDuplicateGroups(images, similarPairs) {
+    const filenames = images.map(img => img.filename);
+    const filenameSet = new Set(filenames);
+    const relevantPairs = similarPairs.filter(p => filenameSet.has(p.filename1) && filenameSet.has(p.filename2));
+    const graph = {};
+    relevantPairs.forEach(p => {
+        if (!graph[p.filename1]) graph[p.filename1] = [];
+        if (!graph[p.filename2]) graph[p.filename2] = [];
+        graph[p.filename1].push(p.filename2);
+        graph[p.filename2].push(p.filename1);
+    });
+    const visited = new Set();
+    const groups = [];
+    for (let f of filenames) {
+        if (!visited.has(f) && graph[f]) {
+            const stack = [f];
+            const component = [];
+            while (stack.length) {
+                const node = stack.pop();
+                if (visited.has(node)) continue;
+                visited.add(node);
+                component.push(node);
+                if (graph[node]) {
+                    for (let neighbor of graph[node]) {
+                        if (!visited.has(neighbor)) {
+                            stack.push(neighbor);
+                        }
+                    }
+                }
+            }
+            if (component.length > 1) {
+                groups.push(component);
+            }
+        }
+    }
+    return groups;
 }
 
 function resetFiltersAndReload() {
@@ -861,6 +1151,8 @@ async function loadImages() {
     const images = await resp.json();
     currentImagesRaw = images;
     applyFilters();
+    const countSpan = document.getElementById('imageCount');
+    if (countSpan) countSpan.textContent = currentImagesRaw.length;
 }
 
 function applyFilters() {
@@ -870,35 +1162,41 @@ function applyFilters() {
         return;
     }
 
-    const filtered = currentImagesRaw.filter(img => {
-        if (filters.ratings.length > 0 && !filters.ratings.includes(img.rating)) {
-            return false;
-        }
-
+    let filtered = currentImagesRaw.filter(img => {
+        if (filters.ratings.length > 0 && !filters.ratings.includes(img.rating)) return false;
         if (filters.minW !== null && img.width < filters.minW) return false;
         if (filters.maxW !== null && img.width > filters.maxW) return false;
         if (filters.minH !== null && img.height < filters.minH) return false;
         if (filters.maxH !== null && img.height > filters.maxH) return false;
-
         if (filters.aspects.length > 0) {
             const aspect = getAspectLabel(img.width / img.height);
             if (!filters.aspects.includes(aspect)) return false;
         }
-
         const multiple32 = (img.width % 32 === 0 && img.height % 32 === 0);
         const multiple64 = (img.width % 64 === 0 && img.height % 64 === 0);
-
         if (filters.multipleNot) {
             if (multiple32 || multiple64) return false;
         } else {
             if (filters.multiple32 && !multiple32) return false;
             if (filters.multiple64 && !multiple64) return false;
         }
-
         return true;
     });
 
-    currentImages = filtered;
+    if (filters.duplicates) {
+        const components = buildDuplicateComponents(filtered, window.similarPairs, window.duplicateGroups);
+        const duplicateComponents = components.filter(comp => comp.length > 1);
+        const orderedFilenames = [];
+        duplicateComponents.forEach(comp => {
+            comp.sort((a, b) => a.localeCompare(b));
+            orderedFilenames.push(...comp);
+        });
+        const filenameToImg = new Map(filtered.map(img => [img.filename, img]));
+        currentImages = orderedFilenames.map(fname => filenameToImg.get(fname)).filter(img => img);
+    } else {
+        currentImages = filtered;
+    }
+
     renderImageGrid(currentImages);
 }
 
@@ -1201,64 +1499,101 @@ async function updateInfoBadges(img) {
         console.error('Ошибка получения рейтинга:', e);
     }
 
-    let ratingBadgeClass = 'green';
-    let ratingText = 'PG';
-    if (rating === 'general') {
-        ratingText = 'PG';
-        ratingBadgeClass = 'green';
-    } else if (rating === 'sensitive') {
-        ratingText = 'PG-13';
-        ratingBadgeClass = 'green';
-    } else if (rating === 'questionable') {
-        ratingText = 'R';
-        ratingBadgeClass = 'red';
-    } else if (rating === 'explicit') {
-        ratingText = 'XXX';
-        ratingBadgeClass = 'red';
+    let qualityData = null;
+    try {
+        const qResp = await fetch(`/api/image-quality/${encodeURIComponent(img.filename)}`);
+        qualityData = await qResp.json();
+    } catch (e) {
+        console.error('Ошибка получения качества:', e);
     }
 
-    const width = img.width || 0;
-    const height = img.height || 0;
-    const resolution = `${width}x${height}`;
-
+    let width = img.width || 0;
+    let height = img.height || 0;
     let aspect = '?';
-    if (width && height) {
-        const ratio = width / height;
-        const aspects = {
-            '1:1': 1.0,
-            '4:3': 4 / 3,
-            '3:4': 3 / 4,
-            '16:9': 16 / 9,
-            '9:16': 9 / 16,
-            '2:3': 2 / 3,
-            '3:2': 3 / 2,
-            '21:9': 21 / 9,
-            '9:21': 9 / 21,
-        };
-        let best = '?';
-        let minDiff = Infinity;
-        for (let [key, val] of Object.entries(aspects)) {
-            const diff = Math.abs(ratio - val);
-            if (diff < minDiff) {
-                minDiff = diff;
-                best = key;
+    let mult32 = false;
+    let mult64 = false;
+    let overallQuality = null;
+
+    if (qualityData && qualityData.width) {
+        width = qualityData.width;
+        height = qualityData.height;
+        aspect = qualityData.aspect_ratio;
+        mult32 = qualityData.multiple_32;
+        mult64 = qualityData.multiple_64;
+        overallQuality = qualityData.overall_quality;
+    } else {
+        if (width && height) {
+            const ratio = width / height;
+            const aspects = {
+                '1:1': 1.0, '4:3': 4/3, '3:4': 3/4,
+                '16:9': 16/9, '9:16': 9/16,
+                '2:3': 2/3, '3:2': 3/2,
+                '21:9': 21/9, '9:21': 9/21,
+            };
+            let best = '?';
+            let minDiff = Infinity;
+            for (let [key, val] of Object.entries(aspects)) {
+                const diff = Math.abs(ratio - val);
+                if (diff < minDiff) {
+                    minDiff = diff;
+                    best = key;
+                }
             }
+            aspect = best;
         }
-        aspect = best;
+        mult32 = (width % 32 === 0 && height % 32 === 0);
+        mult64 = (width % 64 === 0 && height % 64 === 0);
     }
 
-    const mult32 = (width % 32 === 0 && height % 32 === 0);
-    const mult64 = (width % 64 === 0 && height % 64 === 0);
+    let ratingBadgeClass = rating === 'general' || rating === 'sensitive' ? 'green' : 'red';
+    let ratingText = rating === 'general' ? 'PG' : (rating === 'sensitive' ? 'PG-13' : (rating === 'questionable' ? 'R' : 'XXX'));
 
     let badgesHtml = `
         <span class="badge ${ratingBadgeClass}">${ratingText}</span>
-        <span class="badge">${resolution}</span>
+        <span class="badge">${width}x${height}</span>
         <span class="badge">${aspect}</span>
         <span class="badge ${mult32 ? 'green' : 'red'}">${mult32 ? t('multiple_32') : t('not_multiple_32')}</span>
     `;
     if (mult64) {
         badgesHtml += `<span class="badge green">${t('multiple_64')}</span>`;
     }
+
+    if (overallQuality !== null) {
+        let sharp_norm = Math.min(qualityData.sharpness / 30.0, 1.0) * 100;
+        let res_perc = qualityData.resolution_score * 100;
+        let no_artifacts = (1 - qualityData.jpeg_artifacts) * 100;
+        let no_noise = (1 - qualityData.noise_level) * 100;
+        let mult_bonus = (mult32 || mult64) ? 4 : 0;
+
+        let sharp_contrib = (0.15 * sharp_norm).toFixed(1);
+        let res_contrib = (0.65 * res_perc).toFixed(1);
+        let art_contrib = (0.08 * no_artifacts).toFixed(1);
+        let noise_contrib = (0.08 * no_noise).toFixed(1);
+        let mult_contrib = mult_bonus.toFixed(1);
+
+        let tooltip = `${t('sharpness')}: ${sharp_contrib}% (15%)\n` +
+                      `${t('resolution')}: ${res_contrib}% (65%)\n` +
+                      `${t('artifacts')}: ${art_contrib}% (8%)\n` +
+                      `${t('noise')}: ${noise_contrib}% (8%)\n` +
+                      `${t('multiplicity_bonus')}: ${mult_contrib}% (4%)\n` +
+                      `${t('total')}: ${overallQuality.toFixed(1)}%`;
+
+        let qualityClass = overallQuality < 65 ? 'red' : (overallQuality < 80 ? 'yellow' : 'green');
+        badgesHtml += `<span class="badge ${qualityClass}" title="${tooltip}">${t('quality')}: ${overallQuality.toFixed(0)}%</span>`;
+    }
+
+    try {
+        const similarResp = await fetch(`/api/similar/${encodeURIComponent(img.filename)}`);
+        const similarList = await similarResp.json();
+        if (similarList.length > 0) {
+            const topSim = similarList.slice(0, 3);
+            let tooltip = t('similar_images') + ':\n' + topSim.map(s => `${s.filename} (${(s.similarity*100).toFixed(0)}%)`).join('\n');
+            badgesHtml += `<span class="badge red" title="${tooltip}">${t('duplicate')}</span>`;
+        }
+    } catch (e) {
+        console.error('Ошибка получения похожих:', e);
+    }
+
     infoBadges.innerHTML = badgesHtml;
 }
 
@@ -1597,12 +1932,43 @@ function attachMassHandlers() {
         if (!confirm(t('confirm_rename'))) return;
         await fetch('/api/bulk-rename', { method: 'POST' });
         alert(t('rename_complete'));
+
+        await reloadDuplicateData();
+
         if (document.querySelector('.tab-button.active').dataset.tab === 'point') {
             await refreshTagList();
             loadTagsAndImages();
         } else if (document.querySelector('.tab-button.active').dataset.tab === 'analysis') {
             refreshAnalysis();
         }
+    });
+
+    document.getElementById('startAnalyzeBtn')?.addEventListener('click', async () => {
+        if (!currentDatasetPath) {
+            alert(t('no_dataset'));
+            return;
+        }
+        const resp = await fetch('/api/analyze/start', { method: 'POST' });
+        const data = await resp.json();
+        if (data.error) {
+            alert(data.error);
+            return;
+        }
+        analyzeActive = true;
+        startAnalyzePolling();
+        updateAnalyzeButtons();
+        const statusResp = await fetch('/api/analyze/status');
+        const status = await statusResp.json();
+        updateAnalyzeProgress(status);
+    });
+
+    document.getElementById('stopAnalyzeBtn')?.addEventListener('click', async () => {
+        await fetch('/api/analyze/stop', { method: 'POST' });
+        analyzeActive = false;
+        stopAnalyzePolling();
+        updateAnalyzeButtons();
+        const container = document.getElementById('analyzeProgressContainer');
+        if (container) container.style.display = 'none';
     });
 
     document.getElementById('bulkDeleteBtn')?.addEventListener('click', async () => {
@@ -1830,13 +2196,15 @@ function attachSettingsHandlers() {
     const workingDirInput = document.getElementById('workingDirectoryInput');
     const zoomEnabledCheck = document.getElementById('zoomEnabledCheckbox');
     const zoomFactorInput = document.getElementById('zoomFactorInput');
+    const serverHostInput = document.getElementById('serverHostInput');
+    const serverPortInput = document.getElementById('serverPortInput');
 
     (async () => {
         const resp = await fetch('/api/settings');
         const settings = await resp.json();
-        if (workingDirInput) {
-            workingDirInput.value = settings.working_directory || '';
-        }
+        if (workingDirInput) workingDirInput.value = settings.working_directory || '';
+        if (serverHostInput) serverHostInput.value = settings.server_host || '';
+        if (serverPortInput) serverPortInput.value = settings.server_port || '';
     })();
 
     async function saveAllSettings() {
@@ -1845,6 +2213,22 @@ function attachSettingsHandlers() {
         const wd = workingDirInput ? workingDirInput.value : '';
         const zoomEnabledVal = zoomEnabledCheck ? zoomEnabledCheck.checked : true;
         const zoomFactorVal = zoomFactorInput ? parseFloat(zoomFactorInput.value) || 2 : 2;
+        let serverHost = serverHostInput ? serverHostInput.value.trim() : '';
+        let serverPort = serverPortInput ? serverPortInput.value.trim() : '';
+
+        if (serverHost && !isValidIP(serverHost)) {
+            alert(t('invalid_ip') || 'Введите корректный IP-адрес (например, 127.0.0.1, 0.0.0.0, localhost)');
+            return;
+        }
+        if (serverPort) {
+            const portNum = parseInt(serverPort, 10);
+            if (isNaN(portNum) || portNum < 1 || portNum > 65535) {
+                alert(t('invalid_port') || 'Порт должен быть числом от 1 до 65535');
+                return;
+            }
+            serverPort = portNum.toString();
+        }
+
         await fetch('/api/settings', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -1853,7 +2237,9 @@ function attachSettingsHandlers() {
                 accent_color: color,
                 working_directory: wd,
                 zoom_enabled: zoomEnabledVal,
-                zoom_factor: zoomFactorVal
+                zoom_factor: zoomFactorVal,
+                server_host: serverHost,
+                server_port: serverPort
             })
         });
         zoomEnabled = zoomEnabledVal;
@@ -1878,16 +2264,13 @@ function attachSettingsHandlers() {
     });
     colorPicker.addEventListener('change', saveAllSettings);
 
-    if (workingDirInput) {
-        workingDirInput.addEventListener('change', saveAllSettings);
-    }
-
+    if (workingDirInput) workingDirInput.addEventListener('change', saveAllSettings);
     if (zoomEnabledCheck && zoomFactorInput) {
-        zoomEnabledCheck.checked = zoomEnabled;
-        zoomFactorInput.value = zoomFactor;
         zoomEnabledCheck.addEventListener('change', saveAllSettings);
         zoomFactorInput.addEventListener('input', saveAllSettings);
     }
+    if (serverHostInput) serverHostInput.addEventListener('change', saveAllSettings);
+    if (serverPortInput) serverPortInput.addEventListener('change', saveAllSettings);
 
     document.getElementById('resetRatingsBtn')?.addEventListener('click', async () => {
         if (!confirm(t('confirm_reset_ratings') || 'Вы уверены? Все сохранённые рейтинги будут удалены.')) return;
@@ -2017,6 +2400,17 @@ function attachAutoHandlersToMass() {
             if (status.running) {
                 startRatingPolling();
                 updateRatingProgress(status);
+            }
+        });
+
+    fetch('/api/analyze/status')
+        .then(res => res.json())
+        .then(status => {
+            if (status.running) {
+                analyzeActive = true;
+                startAnalyzePolling();
+                updateAnalyzeProgress(status);
+                updateAnalyzeButtons();
             }
         });
 })();toggleVocabBtn
