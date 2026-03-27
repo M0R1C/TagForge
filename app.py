@@ -3,6 +3,11 @@ import re
 import shutil
 import threading
 from collections import Counter
+from utils import get_file_hash, get_image_files, get_caption_path, natural_key
+import concurrent.futures
+import multiprocessing
+import socket
+from multiprocessing import Manager
 from datetime import datetime
 from werkzeug.utils import secure_filename
 import hashlib
@@ -12,14 +17,18 @@ from collections import OrderedDict
 import json
 from database import (
     DB_PATH,
-    save_global_widget_layout, get_global_widget_layout, clear_all_image_ratings,
+    save_global_widget_layout, get_global_widget_layout, clear_all_analysis_data,
     get_setting, get_all_translations, set_setting, init_db, add_flag,
     save_dataset_vocabulary, get_dataset_vocabulary, save_image_rating,
     get_image_rating_and_hash, get_all_ratings_for_dataset,
-    get_all_flags, rename_flag, delete_flag, get_image_rating
+    get_all_flags, rename_flag, delete_flag, get_image_rating, delete_image_quality,
+    get_image_quality, update_duplicate_groups, update_similar_pairs,
+    remove_from_duplicate_groups, remove_from_similar_pairs, rename_file_in_similar_pairs,
+    rename_file_in_duplicate_groups, rename_folder_prefix_in_db, get_version_stats
 )
 import sqlite3
 from auto_tag import AutoTagger
+from image_analyzer import ImageAnalyzer
 
 app = Flask(__name__)
 app.json.sort_keys = False
@@ -39,6 +48,12 @@ auto_tag_status = {
 auto_tag_lock = threading.Lock()
 tagger = AutoTagger(models_dir='models')
 
+analyzer_status = {
+    'running': False
+}
+analyzer_lock = threading.Lock()
+analyzer = ImageAnalyzer()
+
 backup_status = {
     'running': False,
     'total': 0,
@@ -57,6 +72,9 @@ rating_status = {
 }
 rating_lock = threading.Lock()
 
+analyzer_progress = None
+analyzer_progress_lock = threading.Lock()
+
 RATING_MODEL = "wd-swinv2-tagger-v3"
 
 def get_file_hash(filepath):
@@ -66,6 +84,14 @@ def get_file_hash(filepath):
             sha256.update(block)
     return sha256.hexdigest()
 
+def is_port_available(host, port):
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind((host, port))
+            return True
+    except socket.error:
+        return False
+
 def get_image_files(path):
     valid_ext = ('.jpg', '.jpeg', '.png', '.webp')
     files = []
@@ -74,6 +100,20 @@ def get_image_files(path):
             files.append(f)
     files.sort(key=natural_key)
     return files
+
+def get_server_ips():
+    ips = set()
+    ips.add('127.0.0.1')
+    try:
+        hostname = socket.gethostname()
+        ips.add(socket.gethostbyname(hostname))
+        for info in socket.getaddrinfo(hostname, None):
+            addr = info[4][0]
+            if ':' not in addr:
+                ips.add(addr)
+    except:
+        pass
+    return list(ips)
 
 def get_caption_path(image_path):
     base, _ = os.path.splitext(image_path)
@@ -121,6 +161,35 @@ def get_working_directory():
     if not os.path.isdir(abs_path):
         return None
     return abs_path
+
+def process_one_image(args):
+    dataset_path, filename, progress = args
+    img_path = os.path.join(dataset_path, filename)
+    try:
+        from database import get_image_quality, save_image_quality
+        from image_analyzer import ImageAnalyzer
+        from utils import get_file_hash
+
+        saved = get_image_quality(dataset_path, filename)
+        current_hash = get_file_hash(img_path)
+        if saved and saved.get('file_hash') == current_hash:
+            result = filename, 'skipped'
+        else:
+            analyzer = ImageAnalyzer()
+            metrics = analyzer.analyze_image(img_path)
+            if metrics:
+                save_image_quality(dataset_path, filename, metrics)
+            result = filename, 'analyzed'
+
+        progress['processed'] = progress.get('processed', 0) + 1
+        progress['current_file'] = filename
+
+        return result
+    except Exception as e:
+        import logging
+        logging.error(f"Ошибка анализа {filename}: {e}")
+        progress['processed'] = progress.get('processed', 0) + 1
+        return filename, 'error'
 
 def safe_join(working_dir, *paths):
     full = os.path.realpath(os.path.join(working_dir, *paths))
@@ -180,6 +249,116 @@ def perform_backup(dataset_path):
     with backup_lock:
         backup_status['running'] = False
         backup_status['current_file'] = ''
+
+def perform_analysis(dataset_path):
+    global analyzer_status, analyzer_progress, analyzer_progress_lock
+    images = get_image_files(dataset_path)
+    total = len(images)
+    with analyzer_lock:
+        if analyzer_status['running']:
+            return
+        analyzer_status['running'] = True
+
+    manager = Manager()
+    progress = manager.dict({
+        'total': total,
+        'processed': 0,
+        'current_file': ''
+    })
+    with analyzer_progress_lock:
+        analyzer_progress = progress
+
+    args_list = [(dataset_path, f, progress) for f in images]
+    num_workers = min(multiprocessing.cpu_count(), 8)
+
+    with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+        future_to_file = {executor.submit(process_one_image, args): args[1] for args in args_list}
+        for future in concurrent.futures.as_completed(future_to_file):
+            pass
+
+    try:
+        from database import update_duplicate_groups, update_similar_pairs
+        update_duplicate_groups(dataset_path)
+        update_similar_pairs(dataset_path)
+    except Exception as e:
+        app.logger.error(f"Ошибка обновления групп: {e}")
+
+    with analyzer_lock:
+        analyzer_status['running'] = False
+    with analyzer_progress_lock:
+        analyzer_progress = None
+
+    app.logger.info("Анализ завершён")
+
+
+@app.route('/api/analyze/start', methods=['POST'])
+def analyze_start():
+    if not current_dataset_path:
+        return jsonify({'error': 'Датасет не загружен'}), 400
+    with analyzer_lock:
+        if analyzer_status['running']:
+            return jsonify({'error': 'Анализ уже выполняется'}), 400
+    thread = threading.Thread(target=perform_analysis, args=(current_dataset_path,))
+    thread.daemon = True
+    thread.start()
+    return jsonify({'success': True})
+
+
+@app.route('/api/analyze/status', methods=['GET'])
+def analyze_status():
+    with analyzer_lock:
+        running = analyzer_status['running']
+    with analyzer_progress_lock:
+        if analyzer_progress is not None:
+            progress = dict(analyzer_progress)
+        else:
+            progress = {'total': 0, 'processed': 0, 'current_file': ''}
+    return jsonify({
+        'running': running,
+        'total': progress['total'],
+        'processed': progress['processed'],
+        'current_file': progress['current_file']
+    })
+
+@app.route('/api/analyze/stop', methods=['POST'])
+def analyze_stop():
+    with analyzer_lock:
+        if not analyzer_status['running']:
+            return jsonify({'error': 'Анализ не выполняется'}), 400
+        analyzer_status['running'] = False
+    return jsonify({'success': True, 'warning': 'Процессы остановки не поддерживаются, но статус сброшен'})
+
+@app.route('/api/duplicates', methods=['GET'])
+def get_duplicates():
+    if not current_dataset_path:
+        return jsonify({'error': 'Датасет не загружен'}), 400
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute('''
+            SELECT file_hash, files FROM duplicate_groups
+            WHERE file_hash IN (SELECT file_hash FROM image_quality WHERE dataset_path=?)
+        ''', (current_dataset_path,))
+        rows = c.fetchall()
+        groups = [{'hash': row[0], 'files': json.loads(row[1])} for row in rows]
+    return jsonify(groups)
+
+
+@app.route('/api/similar/<filename>', methods=['GET'])
+def get_similar(filename):
+    if not current_dataset_path:
+        return jsonify({'error': 'Датасет не загружен'}), 400
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute('''
+            SELECT filename2, similarity FROM similar_pairs
+            WHERE dataset_path=? AND filename1=?
+            UNION
+            SELECT filename1, similarity FROM similar_pairs
+            WHERE dataset_path=? AND filename2=?
+        ''', (current_dataset_path, filename, current_dataset_path, filename))
+        rows = c.fetchall()
+        similar = [{'filename': row[0], 'similarity': row[1]} for row in rows]
+    return jsonify(similar)
 
 @app.route('/api/backup/start', methods=['POST'])
 def backup_start():
@@ -299,7 +478,11 @@ def analyze_ratings_background(dataset_path):
 
 @app.route('/')
 def index():
-    return render_template('index.html')
+    client_ip = request.remote_addr
+    server_ips = get_server_ips()
+
+    show_path_input = client_ip in server_ips
+    return render_template('index.html', show_path_input=show_path_input)
 
 @app.route('/api/load-dataset', methods=['POST'])
 def load_dataset():
@@ -311,18 +494,45 @@ def load_dataset():
 
     with rating_lock:
         rating_status['dataset_path'] = None
+    with analyzer_lock:
+        analyzer_status['dataset_path'] = None
 
     current_dataset_path = path
     images = get_image_files(path)
 
-    thread = threading.Thread(target=analyze_ratings_background, args=(path,))
-    thread.daemon = True
-    thread.start()
+    thread_rating = threading.Thread(target=analyze_ratings_background, args=(path,))
+    thread_rating.daemon = True
+    thread_rating.start()
+
+    thread_quality = threading.Thread(target=perform_analysis, args=(path,))
+    thread_quality.daemon = True
+    thread_quality.start()
 
     return jsonify({
         'count': len(images),
         'images': images[:20]
     })
+
+@app.route('/api/image-quality/<path:filename>', methods=['GET'])
+def get_image_quality_api(filename):
+    if not current_dataset_path:
+        return jsonify({'error': 'Датасет не загружен'}), 400
+    quality = get_image_quality(current_dataset_path, filename)
+    if quality:
+        return jsonify({
+            'width': quality['width'],
+            'height': quality['height'],
+            'aspect_ratio': quality['aspect_ratio'],
+            'multiple_32': bool(quality['multiple_32']),
+            'multiple_64': bool(quality['multiple_64']),
+            'overall_quality': quality['overall_quality'],
+            'sharpness': quality['sharpness'],
+            'jpeg_artifacts': quality['jpeg_artifacts'],
+            'noise_level': quality['noise_level'],
+            'resolution_score': quality['resolution_score']
+        })
+    else:
+        return jsonify({})
 
 @app.route('/api/get-tags', methods=['GET'])
 def get_tags():
@@ -339,6 +549,14 @@ def get_images():
     data = request.get_json()
     selected_tags = data.get('tags', [])
     image_files = get_image_files(current_dataset_path)
+
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            'SELECT DISTINCT filename1 FROM similar_pairs WHERE dataset_path=? UNION SELECT DISTINCT filename2 FROM similar_pairs WHERE dataset_path=?',
+            (current_dataset_path, current_dataset_path))
+        dup_files = set(row[0] for row in c.fetchall())
+
     result = []
     for img in image_files:
         txt_path = get_caption_path(os.path.join(current_dataset_path, img))
@@ -361,14 +579,15 @@ def get_images():
             'width': w,
             'height': h,
             'rating': rating,
-            'mtime': mtime
+            'mtime': mtime,
+            'has_duplicate': img in dup_files
         })
     return jsonify(result)
 
 @app.route('/api/reset-ratings', methods=['POST'])
 def reset_ratings():
     try:
-        clear_all_image_ratings()
+        clear_all_analysis_data()
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -523,28 +742,83 @@ def rename_dataset_item(dataset_name):
     wd = get_working_directory()
     if not wd:
         return jsonify({'error': 'Рабочая директория не задана'}), 400
+
     data = request.get_json()
     old_name = data.get('old_name')
     new_name = data.get('new_name')
     current_path = data.get('current_path', '')
+
     if not old_name or not new_name:
         return jsonify({'error': 'Не указаны имена'}), 400
+
     try:
         base_path = safe_join(wd, dataset_name)
         parent = safe_join(base_path, current_path) if current_path else base_path
         old_full = os.path.join(parent, old_name)
         new_full = os.path.join(parent, new_name)
+
         if not os.path.exists(old_full):
             return jsonify({'error': 'Исходный файл не найден'}), 404
         if os.path.exists(new_full):
             return jsonify({'error': 'Файл с новым именем уже существует'}), 400
+
+        is_dir = os.path.isdir(old_full)
+
         os.rename(old_full, new_full)
-        if os.path.isfile(old_full) and old_name.lower().endswith(('.jpg','.jpeg','.png','.webp')):
+
+        if is_dir:
+            rename_folder_prefix_in_db(old_full, new_full)
+            return jsonify({
+                'success': True,
+                'old_path': old_full,
+                'new_path': new_full
+            })
+
+        dataset_path_file = parent
+        old_filename = old_name
+        new_filename = new_name
+
+        if old_name.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
             old_txt = os.path.splitext(old_full)[0] + '.txt'
             new_txt = os.path.splitext(new_full)[0] + '.txt'
             if os.path.exists(old_txt):
                 os.rename(old_txt, new_txt)
-        return jsonify({'success': True})
+
+        file_hash = None
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                'SELECT file_hash FROM image_quality WHERE dataset_path = ? AND filename = ?',
+                (dataset_path_file, old_filename)
+            )
+            row = c.fetchone()
+            if row:
+                file_hash = row[0]
+
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                'UPDATE image_quality SET filename = ? WHERE dataset_path = ? AND filename = ?',
+                (new_filename, dataset_path_file, old_filename)
+            )
+            c.execute(
+                'UPDATE image_ratings SET filename = ? WHERE dataset_path = ? AND filename = ?',
+                (new_filename, dataset_path_file, old_filename)
+            )
+            conn.commit()
+
+        rename_file_in_similar_pairs(dataset_path_file, old_filename, new_filename)
+
+        if file_hash:
+            rename_file_in_duplicate_groups(dataset_path_file, old_filename, new_filename, file_hash)
+
+        return jsonify({
+            'success': True,
+            'old_path': old_full,
+            'new_path': new_full,
+            'affected_path': dataset_path_file
+        })
+
     except ValueError as e:
         return jsonify({'error': str(e)}), 403
     except Exception as e:
@@ -564,16 +838,49 @@ def delete_dataset_item(dataset_name):
         base_path = safe_join(wd, dataset_name)
         target = safe_join(base_path, current_path, name) if current_path else safe_join(base_path, name)
         if not os.path.exists(target):
-            print(target)
             return jsonify({'error': 'Файл не найден'}), 404
+
         if os.path.isdir(target):
             shutil.rmtree(target)
+            prefix = target + os.sep
+            with sqlite3.connect(DB_PATH) as conn:
+                c = conn.cursor()
+                for table in ('image_quality', 'image_ratings'):
+                    c.execute(f'DELETE FROM {table} WHERE dataset_path = ? OR dataset_path LIKE ?',
+                              (target, prefix + '%'))
+                c.execute('DELETE FROM similar_pairs WHERE dataset_path = ? OR dataset_path LIKE ?',
+                          (target, prefix + '%'))
+                c.execute('DELETE FROM duplicate_groups WHERE dataset_path = ? OR dataset_path LIKE ?',
+                          (target, prefix + '%'))
+                conn.commit()
+            return jsonify({'success': True, 'old_path': target})
         else:
             os.remove(target)
             txt = os.path.splitext(target)[0] + '.txt'
             if os.path.exists(txt):
                 os.remove(txt)
-        return jsonify({'success': True})
+
+            dataset_path_file = os.path.dirname(target)
+            filename = name
+
+            with sqlite3.connect(DB_PATH) as conn:
+                c = conn.cursor()
+                c.execute('DELETE FROM image_quality WHERE dataset_path = ? AND filename = ?',
+                          (dataset_path_file, filename))
+                c.execute('DELETE FROM image_ratings WHERE dataset_path = ? AND filename = ?',
+                          (dataset_path_file, filename))
+                c.execute('DELETE FROM similar_pairs WHERE dataset_path = ? AND (filename1 = ? OR filename2 = ?)',
+                          (dataset_path_file, filename, filename))
+                conn.commit()
+
+            from database import remove_from_duplicate_groups, remove_from_similar_pairs
+            remove_from_duplicate_groups(dataset_path_file, filename)
+            remove_from_similar_pairs(dataset_path_file, filename)
+
+            affected_path = dataset_path_file
+
+            return jsonify({'success': True, 'old_path': target, 'affected_path': dataset_path_file})
+
     except ValueError as e:
         return jsonify({'error': str(e)}), 403
     except Exception as e:
@@ -589,12 +896,14 @@ def delete_dataset(name):
         return jsonify({'error': 'Датасет не найден'}), 404
     try:
         shutil.rmtree(dataset_path)
+        prefix = dataset_path + os.sep
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
-            c.execute('DELETE FROM image_ratings WHERE dataset_path=?', (dataset_path,))
-            c.execute('DELETE FROM dataset_vocabulary WHERE dataset_path=?', (dataset_path,))
+            for table in ('image_quality', 'image_ratings', 'similar_pairs', 'duplicate_groups'):
+                c.execute(f'DELETE FROM {table} WHERE dataset_path = ? OR dataset_path LIKE ?',
+                          (dataset_path, prefix + '%'))
             conn.commit()
-        return jsonify({'success': True})
+        return jsonify({'success': True, 'old_path': dataset_path})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -675,6 +984,54 @@ def dataset_image(dataset_name, filepath):
         return response
     except Exception as e:
         return str(e), 500
+
+@app.route('/api/version-stats', methods=['GET'])
+def version_stats():
+    dataset_name = request.args.get('dataset')
+    versions = request.args.getlist('versions')
+    if not dataset_name or not versions:
+        return jsonify({'error': 'Не указан датасет или версии'}), 400
+
+    wd = get_working_directory()
+    if not wd:
+        return jsonify({'error': 'Рабочая директория не задана'}), 400
+
+    dataset_path = os.path.join(wd, dataset_name)
+    if not os.path.isdir(dataset_path):
+        return jsonify({'error': 'Датасет не найден'}), 404
+
+    stats = {}
+    for version in versions:
+        version_full_path = os.path.join(dataset_path, version)
+        if not os.path.isdir(version_full_path):
+            stats[version] = {'error': 'Версия не найдена'}
+        else:
+            stats[version] = get_version_stats(version_full_path)
+    return jsonify(stats)
+
+@app.route('/api/version-quality-check', methods=['GET'])
+def version_quality_check():
+    dataset_name = request.args.get('dataset')
+    version = request.args.get('version')
+    if not dataset_name or not version:
+        return jsonify({'has_data': False})
+
+    wd = get_working_directory()
+    if not wd:
+        return jsonify({'has_data': False})
+
+    dataset_path = os.path.join(wd, dataset_name)
+    version_full_path = os.path.join(dataset_path, version)
+
+    if not os.path.isdir(version_full_path):
+        return jsonify({'has_data': False})
+
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute('SELECT COUNT(*) FROM image_quality WHERE dataset_path=?', (version_full_path,))
+        count = c.fetchone()[0]
+
+    return jsonify({'has_data': count > 0})
 
 @app.route('/api/datasets/<name>/fullpath', methods=['GET'])
 def dataset_fullpath(name):
@@ -847,14 +1204,22 @@ def rename_dataset(old_name):
 
     try:
         os.rename(old_path, new_path)
+        prefix = old_path + os.sep
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
-            c.execute('UPDATE image_ratings SET dataset_path = ? WHERE dataset_path = ?',
-                      (new_path, old_path))
-            c.execute('UPDATE dataset_vocabulary SET dataset_path = ? WHERE dataset_path = ?',
-                      (new_path, old_path))
+            for table in ('image_quality', 'image_ratings', 'similar_pairs', 'duplicate_groups'):
+                c.execute(f'SELECT DISTINCT dataset_path FROM {table} WHERE dataset_path = ? OR dataset_path LIKE ?',
+                          (old_path, prefix + '%'))
+                rows = c.fetchall()
+                for (old_db_path,) in rows:
+                    if old_db_path == old_path:
+                        new_db_path = new_path
+                    else:
+                        new_db_path = new_path + old_db_path[len(old_path):]
+                    c.execute(f'UPDATE {table} SET dataset_path = ? WHERE dataset_path = ?',
+                              (new_db_path, old_db_path))
             conn.commit()
-        return jsonify({'success': True, 'new_name': safe_new})
+        return jsonify({'success': True, 'new_name': safe_new, 'old_path': old_path, 'new_path': new_path})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -946,10 +1311,16 @@ def delete_dataset_version(name, version):
     except Exception as e:
         return jsonify({'error': f'Не удалось удалить папку: {str(e)}'}), 500
 
+    prefix = version_path + os.sep
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
-        c.execute('DELETE FROM image_ratings WHERE dataset_path=? AND filename LIKE ?',
-                  (dataset_path, version + '/%'))
+        for table in ('image_quality', 'image_ratings'):
+            c.execute(f'DELETE FROM {table} WHERE dataset_path = ? OR dataset_path LIKE ?',
+                      (version_path, prefix + '%'))
+        c.execute('DELETE FROM similar_pairs WHERE dataset_path = ? OR dataset_path LIKE ?',
+                  (version_path, prefix + '%'))
+        c.execute('DELETE FROM duplicate_groups WHERE dataset_path = ? OR dataset_path LIKE ?',
+                  (version_path, prefix + '%'))
         conn.commit()
 
     meta_path = os.path.join(dataset_path, 'metadata.json')
@@ -961,7 +1332,7 @@ def delete_dataset_version(name, version):
             with open(meta_path, 'w', encoding='utf-8') as f:
                 json.dump(metadata, f, ensure_ascii=False, indent=2)
 
-    return jsonify({'success': True})
+    return jsonify({'success': True, 'old_path': version_path})
 
 @app.route('/api/vocabulary/<path:dataset_path>', methods=['GET'])
 def get_vocabulary(dataset_path):
@@ -1029,19 +1400,49 @@ def update_caption():
 def bulk_rename():
     if not current_dataset_path:
         return jsonify({'error': 'Датасет не загружен'}), 400
+
     images = get_image_files(current_dataset_path)
+    rename_map = []
+
     for idx, img in enumerate(images, start=1):
         base, ext = os.path.splitext(img)
         new_img_name = f"{idx}{ext}"
         old_img_path = os.path.join(current_dataset_path, img)
         new_img_path = os.path.join(current_dataset_path, new_img_name)
+
         os.rename(old_img_path, new_img_path)
+
         old_txt_path = get_caption_path(old_img_path)
         new_txt_path = get_caption_path(new_img_path)
         if os.path.exists(old_txt_path):
             os.rename(old_txt_path, new_txt_path)
         else:
             write_caption(new_txt_path, '')
+
+        rename_map.append((img, new_img_name))
+
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        for old_name, new_name in rename_map:
+            c.execute('''
+                UPDATE image_quality
+                SET filename = ?
+                WHERE dataset_path = ? AND filename = ?
+            ''', (new_name, current_dataset_path, old_name))
+
+            c.execute('''
+                UPDATE image_ratings
+                SET filename = ?
+                WHERE dataset_path = ? AND filename = ?
+            ''', (new_name, current_dataset_path, old_name))
+
+        c.execute('DELETE FROM duplicate_groups WHERE dataset_path = ?', (current_dataset_path,))
+        c.execute('DELETE FROM similar_pairs WHERE dataset_path = ?', (current_dataset_path,))
+        conn.commit()
+
+    update_duplicate_groups(current_dataset_path)
+    update_similar_pairs(current_dataset_path)
+
     return jsonify({'success': True})
 
 @app.route('/api/bulk-delete-tags', methods=['POST'])
@@ -1195,12 +1596,16 @@ def get_settings():
     wd = get_setting('working_directory', '')
     zoom_enabled = get_setting('zoom_enabled', 'true') == 'true'
     zoom_factor = float(get_setting('zoom_factor', '2.0'))
+    server_host = get_setting('server_host', '')
+    server_port = get_setting('server_port', '')
     return jsonify({
         'language': lang,
         'accent_color': color,
         'working_directory': wd,
         'zoom_enabled': zoom_enabled,
-        'zoom_factor': zoom_factor
+        'zoom_factor': zoom_factor,
+        'server_host': server_host,
+        'server_port': server_port
     })
 
 @app.route('/api/settings', methods=['POST'])
@@ -1211,6 +1616,8 @@ def save_settings():
     wd = data.get('working_directory')
     zoom_enabled = data.get('zoom_enabled')
     zoom_factor = data.get('zoom_factor')
+    server_host = data.get('server_host')
+    server_port = data.get('server_port')
     if lang:
         set_setting('language', lang)
     if color:
@@ -1221,6 +1628,10 @@ def save_settings():
         set_setting('zoom_enabled', 'true' if zoom_enabled else 'false')
     if zoom_factor is not None:
         set_setting('zoom_factor', str(zoom_factor))
+    if server_host is not None:
+        set_setting('server_host', server_host)
+    if server_port is not None:
+        set_setting('server_port', server_port)
     return jsonify({'success': True})
 
 @app.route('/api/delete-image', methods=['POST'])
@@ -1249,9 +1660,23 @@ def delete_image():
             c.execute('DELETE FROM image_ratings WHERE dataset_path=? AND filename=?',
                       (current_dataset_path, filename))
             conn.commit()
+        delete_image_quality(current_dataset_path, filename)
+        remove_from_duplicate_groups(current_dataset_path, filename)
+        remove_from_similar_pairs(current_dataset_path, filename)
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+@app.route('/api/similar-pairs', methods=['GET'])
+def get_similar_pairs():
+    if not current_dataset_path:
+        return jsonify({'error': 'Датасет не загружен'}), 400
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute('SELECT filename1, filename2, similarity FROM similar_pairs WHERE dataset_path=?', (current_dataset_path,))
+        rows = c.fetchall()
+        pairs = [{'filename1': row[0], 'filename2': row[1], 'similarity': row[2]} for row in rows]
+    return jsonify(pairs)
 
 @app.route('/api/widget-layout', methods=['GET'])
 def get_widget_layout_api():
@@ -1362,4 +1787,18 @@ def auto_tag_stop():
     return jsonify({'success': True})
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    host = get_setting('server_host')
+    port = get_setting('server_port')
+    if not host:
+        host = '127.0.0.1'
+    if not port:
+        port = 5000
+    else:
+        port = int(port)
+
+    if not os.environ.get('WERKZEUG_RUN_MAIN'):
+        if not is_port_available(host, port):
+            print(f"Адрес {host}:{port} недоступен, запускаем на 127.0.0.1:5000")
+            host = '127.0.0.1'
+            port = 5000
+    app.run(host=host, port=port, debug=True)
