@@ -3581,3 +3581,195 @@ input[type=number]::-webkit-outer-spin-button {
     -webkit-appearance: none;
     margin: 0;
 }
+
+.analyze-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0, 0, 0, 0.85);
+    backdrop-filter: blur(10px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+    border-radius: 24px;
+}
+
+.analyze-content {
+    text-align: center;
+    color: var(--text-primary);
+}
+
+.analyze-spinner {
+    width: 60px;
+    height: 60px;
+    border: 4px solid var(--border-color);
+    border-top-color: var(--accent-color);
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+    margin: 0 auto 20px;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+.progress-bar-large {
+    width: 300px;
+    height: 12px;
+    background: var(--bg-tertiary);
+    border-radius: 30px;
+    overflow: hidden;
+    margin: 20px 0 10px;
+}
+
+#analyzeOverlayProgressFill {
+    height: 100%;
+    background: linear-gradient(135deg, var(--accent-gradient-start), var(--accent-gradient-end));
+    width: 0%;
+    transition: width 0.3s ease;
+}
+
+#analyzeOverlayPercent {
+    font-size: 24px;
+    font-weight: 700;
+    color: var(--accent-color);
+}
+
+#analyzeOverlayCurrentFile {
+    display: block;
+    margin-top: 10px;
+    font-size: 14px;
+    color: var(--text-secondary);
+    max-width: 400px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.point-layout {
+    position: relative;
+}
+
+#versionCompareConfig {
+    margin-top: 16px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border-color);
+}
+
+#versionCompareConfig .form-group {
+    margin-bottom: 16px;
+}
+
+#compareMetricsGroup {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-top: 8px;
+}
+
+#compareMetricsGroup .custom-checkbox {
+    margin-bottom: 0;
+}
+
+#compareVersion1Select,
+#compareVersion2Select {
+    width: 100%;
+}
+
+.widget-content canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    min-height: 200px;
+}
+
+.version-compare-layout {
+    display: flex;
+    gap: 20px;
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+}
+
+.left-column {
+    flex: 1;
+    min-width: 150px;
+}
+
+.right-column {
+    flex: 1;
+    min-width: 150px;
+}
+
+.right-column-inner {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+@media (max-width: 600px) {
+    .version-compare-layout {
+        flex-direction: column;
+        gap: 16px;
+    }
+    .left-column, .right-column {
+        width: 100%;
+    }
+}
+
+.delete-modal .modal-body strong {
+    display: inline-block;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: bottom;
+}
+
+button,
+.btn,
+.btn-primary,
+.btn-secondary,
+.tag-item,
+.image-card,
+.dataset-card,
+.browser-item,
+.widget-close,
+.widget-settings,
+.resize-handle,
+.filter-toggle-btn,
+.aspect-btn,
+.custom-select-selected,
+.custom-select-option,
+.delete-image-btn,
+.item-rename,
+.item-delete,
+.add-flag-button,
+.flag-save-btn,
+.flag-cancel-btn,
+.version-flag,
+.vocab-tag,
+.suggestion-tag {
+    -webkit-tap-highlight-color: transparent;
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+* {
+    touch-action: manipulation;
+}
+
+@media (hover: none) {
+    .dataset-delete-btn,
+    .dataset-edit-btn,
+    .item-rename,
+    .item-delete,
+    .delete-image-btn {
+        opacity: 1 !important;
+        visibility: visible !important;
+        transition: none !important;
+    }
+}
