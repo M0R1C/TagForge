@@ -9,6 +9,8 @@
 **TagForge** - a flexible tool designed to help you quickly and conveniently store, edit, version, and analyze your datasets.  
 The key priorities are simplicity, ease of use, well‑organized workspaces, and speed
 
+![TagForge Interface](static/ui_preview.webp)
+
 # Features
 
 * **Dataset Manager:** Create structured datasets split into versions, assign custom flags to versions for easy identification, manage version contents (rename, delete, smart fast import from folders, create subfolders inside versions for further segmentation), quickly export datasets to your working environment, easily spin up new versions based on existing ones. No need to manually handle file pairs - the tool automatically associates images with their captions and performs actions (e.g., renaming or deletion) on both when needed
