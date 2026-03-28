@@ -6,7 +6,7 @@
 ![License](https://img.shields.io/github/license/M0R1C/TagForge?style=for-the-badge)
 ![Python](https://img.shields.io/badge/python-3.x-blue?style=for-the-badge)
 
-**TagForge** – a flexible tool designed to help you quickly and conveniently store, edit, version, and analyze your datasets.  
+**TagForge** - a flexible tool designed to help you quickly and conveniently store, edit, version, and analyze your datasets.  
 The key priorities are simplicity, ease of use, well‑organized workspaces, and speed
 
 # Features
