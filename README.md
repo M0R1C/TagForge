@@ -1,208 +1,47 @@
 ![TagForge Logo](static/logo.png)
 
-![GitHub
-stars](https://img.shields.io/github/stars/M0R1C/TagForge?style=for-the-badge)
-![GitHub
-forks](https://img.shields.io/github/forks/M0R1C/TagForge?style=for-the-badge)
-![GitHub
-issues](https://img.shields.io/github/issues/M0R1C/TagForge?style=for-the-badge)
+![GitHub stars](https://img.shields.io/github/stars/M0R1C/TagForge?style=for-the-badge)
+![GitHub forks](https://img.shields.io/github/forks/M0R1C/TagForge?style=for-the-badge)
+![GitHub issues](https://img.shields.io/github/issues/M0R1C/TagForge?style=for-the-badge)
 ![License](https://img.shields.io/github/license/M0R1C/TagForge?style=for-the-badge)
 ![Python](https://img.shields.io/badge/python-3.x-blue?style=for-the-badge)
 
-TagForge - инструмент для работы с датасетами изображений и
-caption‑тегов, предназначенный для подготовки данных к обучению
-генеративных моделей.
+**TagForge** – a flexible tool designed to help you quickly and conveniently store, edit, version, and analyze your datasets.  
+The key priorities are simplicity, ease of use, well‑organized workspaces, and speed
 
-Программа ориентирована на датасеты формата:
+# Features
 
-фото + captions
+* **Dataset Manager:** Create structured datasets split into versions, assign custom flags to versions for easy identification, manage version contents (rename, delete, smart fast import from folders, create subfolders inside versions for further segmentation), quickly export datasets to your working environment, easily spin up new versions based on existing ones. No need to manually handle file pairs - the tool automatically associates images with their captions and performs actions (e.g., renaming or deletion) on both when needed
+* **Bulk Editing:** Edit caption content across all files at once (delete, add, replace), create backups, rename all files with sequential numbering for easier reference, automatically populate captions with tags using AI models. You can easily add your own ONNX models - just place them in the `models` folder and the program will pick them up automatically. Models from **Smiling Wolf** are recommended. You can also adjust confidence thresholds and operation modes
+* **Point Editing:** Navigate your dataset conveniently using filters (age rating, duplicates, image resolution, aspect ratio, x32/x64, presence of specific tags in captions). Get a quick overview of each image through badges showing age rating, resolution, aspect ratio, multiplicity, image quality (with detailed criteria breakdown), and duplicate indicators. Use auto‑complete hints for tags (similar to an IDE) to speed up manual tagging. Build structured tag dictionaries for your datasets and easily add or remove predefined tags from captions - extremely useful when preparing data, for example, for character LoRa models. Examine images in detail with a built‑in magnifier
+* **Analytics:** Use a flexible dashboard with widgets to get visual insights into your dataset contents, assess quality, and compare versions through graphs
+* **Settings:** Choose your preferred interface language (Russian and English are currently supported), customize the UI to your liking, set a convenient working directory (where your datasets are stored; relative, absolute, and remote paths are supported). Configure the tool’s network accessibility (IP address and port) to access it from any device in your home - for instance, work comfortably from a tablet instead of being tied to your computer
+* **Additional:** You can also work with third‑party datasets directly without importing them into the working directory if that’s more convenient - simply specify the absolute path to the dataset in the program header
 
-и помогает быстро **редактировать, анализировать и улучшать датасеты**
-перед обучением моделей.
+# Installation and Launch
 
-------------------------------------------------------------------------
+### **Windows:**
 
-# Основные возможности
+* Make sure you have Python 3.8.x or higher installed on your system
+* Run `setup.bat`. It will automatically create a virtual environment, install dependencies, and generate a `run.bat` file for launching the program
+* Run `run.bat` and enjoy
 
-## Массовое редактирование датасета
+### **Linux:**
 
-TagForge предоставляет инструменты для пакетной обработки caption
-файлов:
+Automated installation via a script is not provided, so you’ll need to do it manually:
 
--   массовое добавление тегов
--   массовое удаление тегов
--   массовая замена тегов
--   редактирование caption файлов
--   нумерация изображений
+* Create a virtual environment (`venv`) inside the program folder
+* Replace the line `onnxruntime-directml>=1.15.0` with `onnxruntime` in `requirements.txt`
+* Install the dependencies from the updated file into your virtual environment
 
-Это позволяет быстро привести датасет к **единому стандарту
-тегирования**.
+This will allow you to install and run the program on Linux systems, but automatic tagging and age rating evaluation will be slower because GPU acceleration won’t be available
 
-------------------------------------------------------------------------
+# Support and Feedback
 
-## Автоматическое тегирование изображений
+I’d be really grateful for your support, stars on the repository, feedback, and any kind of appreciation.
 
-TagForge поддерживает автотегирование изображений с использованием
-моделей **WD Tagger от Smiling Wolf**.
+If you find a bug, have ideas for new features, or would like to help with translations or localization updates, feel free to reach out to me on Telegram - [**@Sansenskiy**](https://t.me/Sansenskiy)
 
-Программа:
+# Acknowledgments
 
--   анализирует изображения
--   определяет релевантные теги
--   добавляет их в caption файлы
-
-Поддерживаются **все WD модели Smiling Wolf**.
-
-Чтобы добавить новую модель:
-
-1.  Скачайте модель со страницы Smiling Wolf на HuggingFace
-2.  Поместите её в папку:
-
-models/
-
-3.  Перезапустите программу
-
-Модель автоматически появится в интерфейсе.
-
-В комплекте уже включена модель:
-
-wd-swinv2-tagger-v3
-
-------------------------------------------------------------------------
-
-## Интерфейс
-
-Программа имеет удобный интерфейс для работы с большими датасетами:
-
--   быстрый просмотр изображений
--   удобная навигация
--   высокая производительность
-
-------------------------------------------------------------------------
-
-## Фильтры изображений
-
-Система фильтров позволяет быстро ориентироваться в датасете.
-
-Фильтрация возможна по:
-
--   тегам
--   признакам изображений
--   различным характеристикам
-
-------------------------------------------------------------------------
-
-## Анализ качества датасета
-
-TagForge содержит систему анализа датасета с графиками.
-
-Она показывает:
-
--   наполнение датасета
--   распределение тегов
--   баланс данных
--   пригодность датасета для обучения
-
-Панель анализа работает по принципу **dashboard** и
-полностью настраивается.
-
-Это помогает, например, обнаружить:
-
--   перекос в сторону NSFW
--   перекос в сторону SFW
-
-и избежать нежелательных перекосов при обучении модели.
-
-------------------------------------------------------------------------
-
-## Словари тегов
-
-TagForge поддерживает систему словарей.
-
-Пользователь может:
-
--   создать словарь для датасета
--   быстро применять нужные теги к изображениям
-
-Это особенно полезно при создании датасетов персонажей с разными
-нарядами или состояниями.
-
-------------------------------------------------------------------------
-
-## Бэкап датасета
-
-Программа поддерживает резервное копирование датасета.
-
-Это позволяет:
-
--   сохранять исходные данные
--   безопасно экспериментировать
--   быстро откатываться к предыдущему состоянию
-
-------------------------------------------------------------------------
-
-## Анализ возрастного рейтинга
-
-TagForge автоматически анализирует изображения и присваивает им
-возрастные рейтинги.
-
-Это помогает контролировать наличие NSFW контента.
-
-------------------------------------------------------------------------
-
-## Кастомизация интерфейса
-
-Пользователь может менять цвета элементов интерфейса.
-
-------------------------------------------------------------------------
-
-## Локализация
-
-Доступные языки:
-
--   Русский
--   English
-
-------------------------------------------------------------------------
-
-# Установка
-
-1.  Запустите setup.bat
-
-2.  Дождитесь завершения установки.
-
-Скрипт автоматически:
-
--   создаст виртуальное окружение
--   установит зависимости
--   создаст run.bat
-
-------------------------------------------------------------------------
-
-# Запуск
-
-После установки просто запустите:
-
-run.bat
-
-------------------------------------------------------------------------
-
-# Благодарности
-
-Отдельная благодарность **Smiling Wolf** за создание моделей WD Tagger.
-
-------------------------------------------------------------------------
-
-# Развитие проекта
-
-Функционал TagForge будет расширяться.
-
-Если вы хотите помочь с локализацией программы:
-
-Telegram: @sansenskiy
-
-------------------------------------------------------------------------
-
-# Поддержка
-
-Если TagForge оказался полезным --- поставьте ⭐ репозиторию.
+[SmilingWolf](https://huggingface.co/SmilingWolf) - for the pre‑trained models used in this tool.
