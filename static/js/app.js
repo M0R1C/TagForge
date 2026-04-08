@@ -9,9 +9,13 @@ let currentImageIndex = 0;
 let allTagsCounter = [];
 let autoTaggingActive = false;
 let autoStatusInterval = null;
+let suspiciousZoomActive = false;
 let currentLanguage = 'ru';
 let translations = {};
+let ratingRunning = false;
 let backupActive = false;
+let trainInProgress = false;
+window.trainInProgress = trainInProgress;
 let backupInterval = null;
 let vocabOrder = [];
 let zoomEnabled = true;
@@ -19,6 +23,13 @@ let analyzeActive = false;
 let analyzeInterval = null;
 let zoomFactor = 2;
 let pendingDeleteFilename = null;
+let semanticActive = false;
+let semanticInterval = null;
+let suspiciousIndex = 0;
+let suspiciousResizeObserver = null;
+let cropActive = false;
+let cropInterval = null;
+let suspiciousList = [];
 
 let currentImagesRaw = [];
 let filters = {
@@ -56,6 +67,11 @@ function isValidIP(ip) {
     return ipRegex.test(ip);
 }
 
+function setBodyHeight() {
+    document.body.style.height = window.innerHeight + 'px';
+}
+setBodyHeight();
+window.addEventListener('resize', setBodyHeight);
 
 const datasetPathInput = document.getElementById('datasetPath');
 const loadBtn = document.getElementById('loadDatasetBtn');
@@ -96,6 +112,1030 @@ const deleteConfirmModal = document.getElementById('deleteConfirmModal');
 const confirmDeleteBtn = document.getElementById('confirmDeleteBtn');
 const cancelDeleteBtn = document.getElementById('cancelDeleteBtn');
 const dontAskCheckbox = document.getElementById('dontAskCheckbox');
+
+async function loadYoloModels() {
+    const resp = await fetch('/api/semantic/yolo-models');
+    const models = await resp.json();
+    const select = document.getElementById('yoloModelSelect');
+    if (!select) return;
+    select.innerHTML = '';
+    if (models.length === 0) {
+        select.innerHTML = '<option value="">' + t('no_models') + '</option>';
+    } else {
+        models.forEach(m => {
+            const option = document.createElement('option');
+            option.value = m;
+            option.textContent = m;
+            select.appendChild(option);
+        });
+    }
+    refreshCustomSelect('#yoloModelSelect');
+}
+
+async function loadClipModels() {
+    const resp = await fetch('/api/semantic/clip-models');
+    const models = await resp.json();
+    const select = document.getElementById('encoderModelSelect');
+    if (!select) return;
+    const currentVal = select.value;
+    select.innerHTML = '';
+    if (models.length === 0) {
+        select.innerHTML = '<option value="">' + t('no_models') + '</option>';
+    } else {
+        select.innerHTML = '';
+        models.forEach(m => {
+            const option = document.createElement('option');
+            option.value = m;
+            option.textContent = m;
+            select.appendChild(option);
+        });
+    }
+    if (currentVal && models.includes(currentVal)) select.value = currentVal;
+    refreshCustomSelect('#encoderModelSelect');
+}
+
+async function loadDinov2Models() {
+    const resp = await fetch('/api/semantic/dinov2-models');
+    const models = await resp.json();
+    const select = document.getElementById('encoderModelSelect');
+    if (!select) return;
+    const currentVal = select.value;
+    select.innerHTML = '';
+    if (models.length === 0) {
+        select.innerHTML = '<option value="">' + t('no_models') + '</option>';
+    } else {
+        select.innerHTML = '';
+        models.forEach(m => {
+            const option = document.createElement('option');
+            option.value = m;
+            option.textContent = m;
+            select.appendChild(option);
+        });
+    }
+    if (currentVal && models.includes(currentVal)) select.value = currentVal;
+    refreshCustomSelect('#encoderModelSelect');
+}
+
+async function populateYoloSelects() {
+    const resp = await fetch('/api/semantic/yolo-models');
+    const models = await resp.json();
+    const selects = ['yoloHandsModelSelect', 'yoloFaceModelSelect', 'yoloEyesModelSelect', 'yoloFeetModelSelect'];
+    selects.forEach(selId => {
+        const select = document.getElementById(selId);
+        if (!select) return;
+        const currentVal = select.value;
+        select.innerHTML = '<option value="">' + t('not_use') + '</option>';
+        models.forEach(m => {
+            const option = document.createElement('option');
+            option.value = m;
+            option.textContent = m;
+            select.appendChild(option);
+        });
+        if (currentVal && models.includes(currentVal)) select.value = currentVal;
+        refreshCustomSelect(`#${selId}`);
+    });
+}
+
+function onEncoderChange() {
+    const encoderSelect = document.getElementById('encoderSelect');
+    const modelGroup = document.getElementById('encoderModelGroup');
+    if (!encoderSelect || !modelGroup) return;
+    const encoder = encoderSelect.value;
+    if (encoder === 'clip') {
+        modelGroup.style.display = 'block';
+        loadClipModels();
+    } else if (encoder === 'dinov2') {
+        modelGroup.style.display = 'block';
+        loadDinov2Models();
+    } else {
+        modelGroup.style.display = 'none';
+    }
+}
+
+function initSemanticSliders() {
+    const autoSlider = document.getElementById('autoThresholdSlider');
+    const autoSpan = document.getElementById('autoThresholdValue');
+    const suspSlider = document.getElementById('suspiciousThresholdSlider');
+    const suspSpan = document.getElementById('suspiciousThresholdValue');
+    if (autoSlider && autoSpan) {
+        const updateAuto = () => {
+            autoSpan.textContent = autoSlider.value;
+            autoSlider.style.setProperty('--fill-percent', ((autoSlider.value - autoSlider.min) / (autoSlider.max - autoSlider.min) * 100) + '%');
+        };
+        updateAuto();
+        autoSlider.addEventListener('input', updateAuto);
+    }
+    if (suspSlider && suspSpan) {
+        const updateSusp = () => {
+            suspSpan.textContent = suspSlider.value;
+            suspSlider.style.setProperty('--fill-percent', ((suspSlider.value - suspSlider.min) / (suspSlider.max - suspSlider.min) * 100) + '%');
+        };
+        updateSusp();
+        suspSlider.addEventListener('input', updateSusp);
+    }
+}
+
+async function startSemanticFilter() {
+    if (!currentDatasetPath) {
+        alert(t('no_dataset'));
+        return;
+    }
+    const detectors = [];
+    const yolo_models = {};
+
+    const handsModel = document.getElementById('yoloHandsModelSelect').value;
+    if (handsModel) {
+        detectors.push('hands_yolo');
+        yolo_models.hands_yolo = handsModel;
+    }
+    const faceModel = document.getElementById('yoloFaceModelSelect').value;
+    if (faceModel) {
+        detectors.push('face_yolo');
+        yolo_models.face_yolo = faceModel;
+    }
+    const eyesModel = document.getElementById('yoloEyesModelSelect').value;
+    if (eyesModel) {
+        detectors.push('eyes_yolo');
+        yolo_models.eyes_yolo = eyesModel;
+    }
+    const feetModel = document.getElementById('yoloFeetModelSelect').value;
+    if (feetModel) {
+        detectors.push('feet_yolo');
+        yolo_models.feet_yolo = feetModel;
+    }
+
+    const encoder = document.getElementById('encoderSelect').value;
+    let encoderModel = null;
+    if (encoder !== '') {
+        encoderModel = document.getElementById('encoderModelSelect').value;
+    }
+    const autoThreshold = parseFloat(document.getElementById('autoThresholdSlider').value);
+    const suspiciousThreshold = parseFloat(document.getElementById('suspiciousThresholdSlider').value);
+
+    const yolo_thresholds = {};
+    if (document.getElementById('yoloHandsModelSelect').value) {
+        yolo_thresholds.hands_yolo = parseFloat(document.getElementById('yoloHandsThreshold').value) || 0.5;
+    }
+    if (document.getElementById('yoloFaceModelSelect').value) {
+        yolo_thresholds.face_yolo = parseFloat(document.getElementById('yoloFaceThreshold').value) || 0.5;
+    }
+    if (document.getElementById('yoloEyesModelSelect').value) {
+        yolo_thresholds.eyes_yolo = parseFloat(document.getElementById('yoloEyesThreshold').value) || 0.5;
+    }
+    if (document.getElementById('yoloFeetModelSelect').value) {
+        yolo_thresholds.feet_yolo = parseFloat(document.getElementById('yoloFeetThreshold').value) || 0.5;
+    }
+
+    const autoTaggerModel = document.getElementById('autoTaggerModelSelect').value;
+    const autoTaggerThreshold = parseFloat(document.getElementById('autoTaggerThresholdSlider').value);
+
+    const userModelHands = document.getElementById('userModelHandsSelect').value;
+    const userModelFace = document.getElementById('userModelFaceSelect').value;
+    const userModelEyes = document.getElementById('userModelEyesSelect').value;
+    const userModelFeet = document.getElementById('userModelFeetSelect').value;
+
+    const clipUncertaintyMargin = parseFloat(document.getElementById('uncertaintyMarginSlider').value);
+
+    const payload = {
+        detectors,
+        yolo_models,
+        yolo_thresholds,
+        encoder: encoder || null,
+        encoder_model: encoderModel,
+        thresholds: {
+            auto: autoThreshold,
+            suspicious: suspiciousThreshold
+        },
+        auto_tagger_model: autoTaggerModel || null,
+        auto_tagger_threshold: autoTaggerThreshold,
+        user_model_hands_yolo: userModelHands || null,
+        user_model_face_yolo: userModelFace || null,
+        user_model_eyes_yolo: userModelEyes || null,
+        user_model_feet_yolo: userModelFeet || null,
+        clip_uncertainty_margin: clipUncertaintyMargin
+    };
+
+    const resp = await fetch('/api/semantic/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+    });
+    const data = await resp.json();
+    if (data.error) {
+        alert(data.error);
+        return;
+    }
+    startSemanticPolling();
+}
+
+async function stopSemanticFilter() {
+    await fetch('/api/semantic/stop', { method: 'POST' });
+    stopSemanticPolling();
+    document.getElementById('semanticProgressContainer').style.display = 'none';
+    document.getElementById('startSemanticBtn').disabled = false;
+    document.getElementById('stopSemanticBtn').disabled = true;
+}
+
+let semanticPollInterval = null;
+function startSemanticPolling() {
+    if (semanticPollInterval) return;
+    semanticPollInterval = setInterval(async () => {
+        const resp = await fetch('/api/semantic/status');
+        const status = await resp.json();
+        updateSemanticProgress(status);
+        if (!status.running) {
+            stopSemanticPolling();
+            document.getElementById('startSemanticBtn').disabled = false;
+            document.getElementById('stopSemanticBtn').disabled = true;
+            if (status.suspicious_count > 0) {
+                showSuspiciousReviewModal();
+            } else if (status.bad_count > 0) {
+                alert(`Фильтрация завершена. Отмечено как плохие: ${status.bad_count} файлов.`);
+            } else {
+                alert('Фильтрация завершена. Все изображения признаны хорошими.');
+            }
+        } else {
+            document.getElementById('startSemanticBtn').disabled = true;
+            document.getElementById('stopSemanticBtn').disabled = false;
+        }
+    }, 500);
+}
+function stopSemanticPolling() {
+    if (semanticPollInterval) {
+        clearInterval(semanticPollInterval);
+        semanticPollInterval = null;
+    }
+}
+
+function updateSemanticProgress(status) {
+    const container = document.getElementById('semanticProgressContainer');
+    const fill = document.getElementById('semanticProgressFill');
+    const current = document.getElementById('semanticCurrentFile');
+    if (!container || !fill) return;
+
+    if (status.running && status.total > 0) {
+        container.style.display = 'block';
+
+        const percent = (status.processed / status.total) * 100;
+        fill.style.width = '0%';
+        void fill.offsetWidth;
+        fill.style.width = percent + '%';
+
+        current.textContent = status.current_file || t('idle');
+    } else if (!status.running) {
+        container.style.display = 'none';
+    } else {
+        container.style.display = 'none';
+    }
+    console.log('Semantic status:', status);
+}
+
+async function loadUserModels() {
+    const resp = await fetch('/api/semantic/user-models');
+    const models = await resp.json();
+    const select = document.getElementById('userModelSelect');
+    if (!select) return;
+    select.innerHTML = '<option value="">' + t('no_model') + '</option>';
+    models.forEach(m => {
+        const opt = document.createElement('option');
+        opt.value = m.id;
+        opt.textContent = `${m.id} (${m.encoder || '?'})`;
+        select.appendChild(opt);
+    });
+    refreshCustomSelect('#userModelSelect');
+}
+
+async function updateAllUserModelSelects() {
+    const encoder = document.getElementById('encoderSelect').value;
+    const encoderModel = document.getElementById('encoderModelSelect').value;
+    const detectors = [
+        { selectId: 'userModelHandsSelect', targetType: 'hand' },
+        { selectId: 'userModelFaceSelect', targetType: 'face' },
+        { selectId: 'userModelEyesSelect', targetType: 'eye' },
+        { selectId: 'userModelFeetSelect', targetType: 'foot' }
+    ];
+    for (const det of detectors) {
+        const select = document.getElementById(det.selectId);
+        if (!select) continue;
+        let url = `/api/semantic/user-models?encoder=${encoder}&target_type=${det.targetType}`;
+        if (encoderModel) url += `&model_name=${encodeURIComponent(encoderModel)}`;
+        const resp = await fetch(url);
+        const models = await resp.json();
+        select.innerHTML = '<option value="">' + t('no_model') + '</option>';
+        models.forEach(m => {
+            const opt = document.createElement('option');
+            opt.value = m.id;
+            opt.textContent = `${m.user_model_name} (${m.created.slice(0,10)})`;
+            select.appendChild(opt);
+        });
+        refreshCustomSelect(`#${det.selectId}`);
+    }
+}
+
+function showTrainModal() {
+    if (window.trainInProgress) {
+        alert(t('training_already_in_progress') || 'Обучение уже запущено. Дождитесь завершения.');
+        return;
+    }
+
+    const modalDiv = document.createElement('div');
+    modalDiv.className = 'modal show';
+    modalDiv.id = 'trainModal';
+    modalDiv.innerHTML = `
+        <div class="modal-content modal-large">
+            <div class="modal-body" style="display: flex; gap: 24px; padding: 24px; padding-bottom: 10px;">
+                <div class="left-col" style="flex: 2; min-width: 0;">
+                    <div class="form-group">
+                        <label>${t('good_images')}</label>
+                        <div id="goodDropZone" class="cover-upload-area" style="min-height: 150px;">
+                            <div class="cover-placeholder">
+                                <span>📷</span>
+                                <p>${t('drag_hint')}</p>
+                            </div>
+                        </div>
+                        <div id="goodPreview" style="margin-top: 8px; font-size: 12px;"></div>
+                    </div>
+                    <div class="form-group" style="margin-top: 16px;">
+                        <label>${t('bad_images')}</label>
+                        <div id="badDropZone" class="cover-upload-area" style="min-height: 150px;">
+                            <div class="cover-placeholder">
+                                <span>📷</span>
+                                <p>${t('drag_bad_hint')}</p>
+                            </div>
+                        </div>
+                        <div id="badPreview" style="margin-top: 8px; font-size: 12px;"></div>
+                    </div>
+                    <div class="form-group" style="margin-top: 16px;">
+                        <div style="background: var(--bg-tertiary); padding: 12px; border-radius: 12px;">
+                            <p style="margin: 0; font-size: 13px; color: var(--text-secondary);">
+                                <strong>ℹ️ ${t('info_important')}</strong>
+                            </p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="right-col" style="flex: 1; min-width: 0;">
+                    <div class="form-group">
+                        <label>${t('model_name_label')}</label>
+                        <input type="text" id="userModelName" class="mass-input" placeholder="my_hand_model" required>
+                    </div>
+                    <div class="form-group">
+                        <label>${t('encoder_label')}</label>
+                        <select id="trainEncoderSelect" class="custom-select">
+                            <option value="clip">CLIP</option>
+                            <option value="dinov2">DINOv2</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>${t('encoder_model_label')}</label>
+                        <select id="trainEncoderModelSelect" class="custom-select"></select>
+                    </div>
+                    <div class="form-group">
+                        <label>${t('target_type_label')}</label>
+                        <select id="trainTargetType" class="custom-select">
+                            <option value="hand">${t('hand')}</option>
+                            <option value="face">${t('face')}</option>
+                            <option value="eye">${t('eye')}</option>
+                            <option value="foot">${t('foot')}</option>
+                        </select>
+                    </div>
+                    <div style="display: flex; gap: 12px; margin-top: 24px;">
+                        <button id="trainCancelBtn" class="btn-secondary" style="flex: 1;">${t('cancel')}</button>
+                        <button id="trainSubmitBtn" class="btn-primary" style="flex: 1;">${t('train')}</button>
+                    </div>
+                </div>
+            </div>
+            <!-- Футер  -->
+            <div class="modal-footer" style="justify-content: flex-start; padding: 18px 18px 18px 18px;">
+                <div id="trainProgress" style="display:none; width: 100%;">
+                    <div class="progress-bar"><div id="trainProgressFill" style="width:0%"></div></div>
+                    <p id="trainStatusText"></p>
+                </div>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(modalDiv);
+    modalDiv.classList.add('show');
+
+    let goodFiles = [];
+    let badFiles = [];
+
+    async function loadTrainEncoderModels() {
+        const encoder = document.getElementById('trainEncoderSelect').value;
+        const select = document.getElementById('trainEncoderModelSelect');
+        if (encoder === 'clip') {
+            const resp = await fetch('/api/semantic/clip-models');
+            const models = await resp.json();
+            select.innerHTML = '';
+            models.forEach(m => {
+                const opt = document.createElement('option');
+                opt.value = m;
+                opt.textContent = m;
+                select.appendChild(opt);
+            });
+        } else if (encoder === 'dinov2') {
+            const resp = await fetch('/api/semantic/dinov2-models');
+            const models = await resp.json();
+            select.innerHTML = '';
+            models.forEach(m => {
+                const opt = document.createElement('option');
+                opt.value = m;
+                opt.textContent = m;
+                select.appendChild(opt);
+            });
+        }
+        refreshCustomSelect('#trainEncoderModelSelect');
+    }
+    document.getElementById('trainEncoderSelect').addEventListener('change', loadTrainEncoderModels);
+    loadTrainEncoderModels();
+
+    function setupDropZone(zoneId, filesArray, previewId) {
+        const zone = document.getElementById(zoneId);
+        zone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            zone.classList.add('dragover');
+        });
+        zone.addEventListener('dragleave', () => zone.classList.remove('dragover'));
+        zone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            zone.classList.remove('dragover');
+            const files = Array.from(e.dataTransfer.files).filter(f => f.type.startsWith('image/'));
+            filesArray.push(...files);
+            updatePreview(previewId, filesArray);
+        });
+        zone.addEventListener('click', () => {
+            const input = document.createElement('input');
+            input.type = 'file';
+            input.multiple = true;
+            input.accept = 'image/*';
+            input.onchange = () => {
+                const files = Array.from(input.files);
+                filesArray.push(...files);
+                updatePreview(previewId, filesArray);
+            };
+            input.click();
+        });
+    }
+
+    function updatePreview(containerId, files) {
+        const container = document.getElementById(containerId);
+        if (container) {
+            container.innerHTML = files.length ? `${t('loaded_files')}: ${files.length}` : '—';
+        }
+    }
+
+    setupDropZone('goodDropZone', goodFiles, 'goodPreview');
+    setupDropZone('badDropZone', badFiles, 'badPreview');
+
+    async function train() {
+        const submitBtn = document.getElementById('trainSubmitBtn');
+        if (window.trainInProgress) {
+            alert(t('training_already_in_progress') || 'Обучение уже запущено.');
+            return;
+        }
+        window.trainInProgress = true;
+        submitBtn.disabled = true;
+
+        const userModelName = document.getElementById('userModelName').value.trim();
+        const targetType = document.getElementById('trainTargetType').value;
+        const encoder = document.getElementById('trainEncoderSelect').value;
+        const encoderModel = document.getElementById('trainEncoderModelSelect').value;
+        if (!userModelName) {
+            alert(t('enter_model_name'));
+            window.trainInProgress = false;
+            submitBtn.disabled = false;
+            return;
+        }
+        if (goodFiles.length === 0 || badFiles.length === 0) {
+            alert(t('need_good_bad'));
+            window.trainInProgress = false;
+            submitBtn.disabled = false;
+            return;
+        }
+        const formData = new FormData();
+        goodFiles.forEach(f => formData.append('good', f));
+        badFiles.forEach(f => formData.append('bad', f));
+        formData.append('encoder', encoder);
+        formData.append('target_type', targetType);
+        formData.append('user_model_name', userModelName);
+        if (encoderModel) formData.append('model_name', encoderModel);
+
+        const progressDiv = document.getElementById('trainProgress');
+        const progressFill = document.getElementById('trainProgressFill');
+        const statusText = document.getElementById('trainStatusText');
+        progressDiv.style.display = 'block';
+        statusText.textContent = t('sending');
+        progressFill.style.width = '0%';
+
+        try {
+            const resp = await fetch('/api/semantic/train', {
+                method: 'POST',
+                body: formData
+            });
+            const data = await resp.json();
+            if (data.success) {
+                statusText.textContent = t('train_complete');
+                progressFill.style.width = '100%';
+                setTimeout(() => {
+                    modalDiv.remove();
+                    if (typeof updateAllUserModelSelects === 'function') {
+                        updateAllUserModelSelects();
+                    }
+                    window.trainInProgress = false;
+                }, 1000);
+            } else {
+                alert(t('error_occurred') + ': ' + (data.error || t('unknown_error')));
+                modalDiv.remove();
+                window.trainInProgress = false;
+            }
+        } catch (err) {
+            alert(t('connection_error') + ': ' + err.message);
+            modalDiv.remove();
+            window.trainInProgress = false;
+        }
+    }
+
+    function handleCancel() {
+        if (window.trainInProgress) {
+            if (confirm('Обучение уже запущено. Закрытие окна не остановит процесс. Продолжить?')) {
+                modalDiv.remove();
+            }
+        } else {
+            modalDiv.remove();
+        }
+    }
+
+    document.getElementById('trainCancelBtn').onclick = handleCancel;
+    document.getElementById('trainSubmitBtn').onclick = train;
+
+    modalDiv.addEventListener('click', (e) => {
+        if (e.target === modalDiv) {
+            if (window.trainInProgress) {
+                if (confirm('Обучение уже запущено. Закрытие окна не остановит процесс. Продолжить?')) {
+                    modalDiv.remove();
+                }
+            } else {
+                modalDiv.remove();
+            }
+        }
+    });
+}
+
+async function loadAutoTaggerModels() {
+    const resp = await fetch('/api/auto-models');
+    const models = await resp.json();
+    const select = document.getElementById('autoTaggerModelSelect');
+    if (!select) return;
+    select.innerHTML = '';
+    if (models.length === 0) {
+        select.innerHTML = '<option value="">' + t('no_models') + '</option>';
+    } else {
+        models.forEach(m => {
+            const option = document.createElement('option');
+            option.value = m;
+            option.textContent = m;
+            select.appendChild(option);
+        });
+    }
+    refreshCustomSelect('#autoTaggerModelSelect');
+}
+
+function attachSemanticHandlers() {
+    const startBtn = document.getElementById('startSemanticBtn');
+    const stopBtn = document.getElementById('stopSemanticBtn');
+    const trainBtn = document.getElementById('trainModelBtn');
+    const encoderSelect = document.getElementById('encoderSelect');
+    const encoderModelSelect = document.getElementById('encoderModelSelect');
+
+    if (startBtn) startBtn.addEventListener('click', startSemanticFilter);
+    if (stopBtn) stopBtn.addEventListener('click', stopSemanticFilter);
+    if (trainBtn) trainBtn.addEventListener('click', showTrainModal);
+    if (encoderSelect) encoderSelect.addEventListener('change', () => {
+        onEncoderChange();
+        updateAllUserModelSelects();
+    });
+    if (encoderModelSelect) encoderModelSelect.addEventListener('change', updateAllUserModelSelects);
+
+    initSemanticSliders();
+    loadYoloModels();
+    loadUserModels();
+    loadAutoTaggerModels();
+    onEncoderChange();
+    updateAllUserModelSelects();
+
+    const autoSlider = document.getElementById('autoTaggerThresholdSlider');
+    const autoSpan = document.getElementById('autoTaggerThresholdValue');
+    if (autoSlider && autoSpan) {
+        const updateAuto = () => {
+            autoSpan.textContent = autoSlider.value;
+            autoSlider.style.setProperty('--fill-percent', ((autoSlider.value - autoSlider.min) / (autoSlider.max - autoSlider.min) * 100) + '%');
+        };
+        updateAuto();
+        autoSlider.addEventListener('input', updateAuto);
+    }
+
+    const marginSlider = document.getElementById('uncertaintyMarginSlider');
+    const marginSpan = document.getElementById('uncertaintyMarginValue');
+    if (marginSlider && marginSpan) {
+        const updateMargin = () => {
+            marginSpan.textContent = parseFloat(marginSlider.value).toFixed(2);
+            const percent = ((marginSlider.value - marginSlider.min) / (marginSlider.max - marginSlider.min) * 100);
+            marginSlider.style.setProperty('--fill-percent', percent + '%');
+        };
+        updateMargin();
+        marginSlider.addEventListener('input', updateMargin);
+    }
+
+    document.querySelectorAll('.expandable-section .section-header').forEach(header => {
+        const targetId = header.getAttribute('data-toggle');
+        const content = document.getElementById(targetId);
+        if (content) {
+            header.addEventListener('click', () => {
+                const isOpen = header.classList.contains('open');
+                if (isOpen) {
+                    header.classList.remove('open');
+                    content.classList.remove('open');
+                } else {
+                    header.classList.add('open');
+                    content.classList.add('open');
+                }
+            });
+            header.classList.remove('open');
+            content.classList.remove('open');
+        }
+    });
+}
+
+async function showSuspiciousReviewModal() {
+    const suspResp = await fetch('/api/semantic/suspicious');
+    const suspicious = await suspResp.json();
+    if (!suspicious.length) return;
+    suspiciousList = suspicious;
+    suspiciousIndex = 0;
+
+    let modalDiv = document.getElementById('suspiciousModal');
+    if (!modalDiv) {
+        modalDiv = document.createElement('div');
+        modalDiv.id = 'suspiciousModal';
+        modalDiv.className = 'modal';
+        modalDiv.innerHTML = `
+            <div class="modal-content">
+                <div class="modal-body" style="display: flex; gap: 28px; padding: 28px;">
+                    <div class="modal-image" style="flex: 0 0 70%; position: relative;">
+                        <img id="suspiciousImg" style="max-width: 100%; max-height: 60vh; object-fit: contain;">
+                    </div>
+                    <div class="modal-info" style="flex: 0 0 30%; padding: 16px; display: flex; flex-direction: column; gap: 12px;">
+                        <h3>${t('suspicious_image')}</h3>
+                        <div><strong>${t('defect_confidence')}:</strong> <span id="suspiciousDefectConfidence"></span></div>
+
+                        <!-- YOLO статистика -->
+                        <div id="suspiciousYoloStats" class="suspicious-stats" style="margin-top: 8px;"></div>
+
+                        <!-- Контекст сцены (теги) в текстовом поле -->
+                        <div>
+                            <strong>${t('scene_context')}:</strong>
+                            <pre id="suspiciousDetails" style="white-space: pre-wrap; font-size: 12px; background: var(--bg-tertiary); padding: 8px; border-radius: 12px; overflow: auto; max-height: 200px; margin-top: 6px;"></pre>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer" style="justify-content: space-between; padding: 20px 28px;">
+                    <span id="suspiciousCounter"></span>
+                    <div style="display: flex; gap: 12px;">
+                        <button id="suspiciousGoodBtn" class="btn-primary">${t('good')}</button>
+                        <button id="suspiciousBadBtn" class="btn-danger">${t('bad')}</button>
+                    </div>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(modalDiv);
+    }
+
+    let canvas = document.getElementById('suspiciousCanvas');
+    if (!canvas) {
+        const modalImage = modalDiv.querySelector('.modal-image');
+        canvas = document.createElement('canvas');
+        canvas.id = 'suspiciousCanvas';
+        canvas.style.position = 'absolute';
+        canvas.style.top = '0';
+        canvas.style.left = '0';
+        canvas.style.width = '100%';
+        canvas.style.height = '100%';
+        canvas.style.pointerEvents = 'none';
+        modalImage.appendChild(canvas);
+    }
+
+    loadSuspiciousItem(0);
+    setupSuspiciousZoom();
+    modalDiv.classList.add('show');
+    attachSuspiciousHandlers();
+    attachSuspiciousResizeObserver();
+
+    modalDiv.addEventListener('click', (e) => {
+        if (e.target === modalDiv) {
+            closeSuspiciousModalAndMarkAllGood();
+        }
+    });
+
+    document.addEventListener('keydown', suspiciousKeyHandler);
+}
+
+async function closeSuspiciousModalAndMarkAllGood() {
+    if (suspiciousList.length === 0) {
+        closeSuspiciousModal();
+        return;
+    }
+    for (const item of suspiciousList) {
+        await fetch('/api/semantic/mark-good', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ filename: item.filename })
+        });
+    }
+    closeSuspiciousModal();
+}
+
+function loadSuspiciousItem(index) {
+    const item = suspiciousList[index];
+    if (!item) return;
+
+    const canvas = document.getElementById('suspiciousCanvas');
+    if (canvas) {
+        const ctx = canvas.getContext('2d');
+        if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+        canvas.width = 0;
+        canvas.height = 0;
+        canvas.style.opacity = '1';
+    }
+
+    suspiciousZoomActive = false;
+    const modal = document.getElementById('suspiciousModal');
+    if (modal) {
+        const container = modal.querySelector('.modal-image');
+        const img = modal.querySelector('#suspiciousImg');
+        if (container) container.classList.remove('zoomed');
+        if (img) {
+            img.style.transform = '';
+            img.style.transformOrigin = '';
+        }
+        const canvas = modal.querySelector('#suspiciousCanvas');
+        if (canvas) {
+            canvas.style.opacity = '1';
+            canvas.width = 0;
+            canvas.height = 0;
+        }
+    }
+
+    const imgEl = document.getElementById('suspiciousImg');
+    if (imgEl) {
+        imgEl.src = `/api/image/${encodeURIComponent(item.filename)}?t=${Date.now()}`;
+        imgEl.onload = () => {
+            drawBoundingBoxes(imgEl, item.visual_data || {});
+        };
+    }
+
+    const yoloStatsDiv = document.getElementById('suspiciousYoloStats');
+    if (yoloStatsDiv && item.detections && item.expected_counts) {
+        const detections = item.detections;
+        const expected = item.expected_counts;
+        let yoloHtml = '<strong>YOLO:</strong><ul style="margin: 6px 0 0 20px; padding: 0;">';
+
+        const mapping = {
+            'hands_yolo': { name: t('hand_plural') || 'рук', expKey: 'hands' },
+            'face_yolo': { name: t('face_plural') || 'лиц', expKey: 'face' },
+            'eyes_yolo': { name: t('eye_plural') || 'глаз', expKey: 'eyes' },
+            'feet_yolo': { name: t('foot_plural') || 'ступней', expKey: 'feet' }
+        };
+
+        for (const [detKey, detData] of Object.entries(detections)) {
+            if (detData.count !== undefined && mapping[detKey]) {
+                const { name, expKey } = mapping[detKey];
+                const count = detData.count;
+                const expectedCount = expected[expKey] !== undefined ? expected[expKey] : '?';
+                yoloHtml += `<li>${t('detected')} ${name}: ${count} (${expectedCount})</li>`;
+            }
+        }
+        yoloHtml += '</ul>';
+        yoloStatsDiv.innerHTML = yoloHtml;
+    } else if (yoloStatsDiv) {
+        yoloStatsDiv.innerHTML = '<strong>YOLO:</strong> нет данных';
+    }
+
+    const detailsPre = document.getElementById('suspiciousDetails');
+    if (detailsPre && item.tags) {
+        const significantTagsSet = new Set(item.significant_tags || []);
+        const tagsHtml = item.tags.map(tag => {
+            if (significantTagsSet.has(tag)) {
+                return `<strong>${escapeHtml(tag)}</strong>`;
+            }
+            return escapeHtml(tag);
+        }).join(', ');
+        detailsPre.innerHTML = tagsHtml || '—';
+    } else if (detailsPre) {
+        detailsPre.innerHTML = '—';
+    }
+
+    const qualitySpan = document.getElementById('suspiciousQuality');
+    const defectSpan = document.getElementById('suspiciousDefectConfidence');
+    if (qualitySpan) {
+        qualitySpan.textContent = (item.overall_score !== undefined ? (item.overall_score * 100).toFixed(0) + '%' : '—');
+    }
+    if (defectSpan) {
+        defectSpan.textContent = (item.defect_confidence !== undefined ? (item.defect_confidence * 100).toFixed(0) + '%' : '—');
+    }
+
+    const counterSpan = document.getElementById('suspiciousCounter');
+    if (counterSpan) {
+        counterSpan.textContent = `${index+1} из ${suspiciousList.length}`;
+    }
+}
+
+function drawBoundingBoxes(imgElement, visualData) {
+    if (!imgElement.complete || imgElement.naturalWidth === 0) {
+            imgElement.onload = () => drawBoundingBoxes(imgElement, visualData);
+            return;
+        }
+    const canvas = document.getElementById('suspiciousCanvas');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    if (suspiciousZoomActive) return;
+
+    if (!imgElement.complete || imgElement.naturalWidth === 0) {
+        imgElement.onload = () => drawBoundingBoxes(imgElement, visualData);
+        return;
+    }
+
+    const dpr = window.devicePixelRatio || 1;
+    const imgRect = imgElement.getBoundingClientRect();
+    const naturalW = imgElement.naturalWidth;
+    const naturalH = imgElement.naturalHeight;
+
+    const scale = Math.min(imgRect.width / naturalW, imgRect.height / naturalH);
+    const displayW = naturalW * scale;
+    const displayH = naturalH * scale;
+    const offsetX = (imgRect.width - displayW) / 2;
+    const offsetY = (imgRect.height - displayH) / 2;
+
+    canvas.width = imgRect.width * dpr;
+    canvas.height = imgRect.height * dpr;
+    canvas.style.width = `${imgRect.width}px`;
+    canvas.style.height = `${imgRect.height}px`;
+
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, imgRect.width, imgRect.height);
+
+    ctx.lineWidth = 2.5;
+    ctx.font = 'bold 14px Inter, sans-serif';
+    ctx.shadowBlur = 0;
+
+    const colors = {
+        hands_yolo: '#00ccff', hands: '#00ccff',
+        face_yolo: '#ff4444', face: '#ff4444',
+        eyes_yolo: '#ffff00', eyes: '#ffff00',
+        feet_yolo: '#ff8800', feet: '#ff8800'
+    };
+    const labels = {
+        hands_yolo: t('hand'), hands: t('hand'),
+        face_yolo: t('face'), face: t('face'),
+        eyes_yolo: t('eye'), eyes: t('eye'),
+        feet_yolo: t('foot'), feet: t('foot')
+    };
+
+    for (const [detector, data] of Object.entries(visualData)) {
+        if (!data.boxes || data.boxes.length === 0) continue;
+        const color = colors[detector] || '#ffffff';
+        ctx.strokeStyle = color;
+        ctx.fillStyle = color;
+
+        data.boxes.forEach((box, idx) => {
+            const [x1_px, y1_px, x2_px, y2_px] = box;
+            const confidence = box.length > 4 ? box[4] : null;
+
+            const x1 = x1_px * scale + offsetX;
+            const y1 = y1_px * scale + offsetY;
+            const x2 = x2_px * scale + offsetX;
+            const y2 = y2_px * scale + offsetY;
+            const w = x2 - x1;
+            const h = y2 - y1;
+            if (w <= 0 || h <= 0) return;
+
+            ctx.beginPath();
+            ctx.rect(x1, y1, w, h);
+            ctx.stroke();
+
+            let labelText = `${labels[detector] || detector} #${idx + 1}`;
+            if (confidence !== null) {
+                labelText += ` (${(confidence * 100).toFixed(0)}%)`;
+            }
+            ctx.fillStyle = color;
+            ctx.shadowBlur = 5;
+            ctx.shadowColor = 'black';
+            ctx.fillText(labelText, x1 + 2, y1 - 4);
+            ctx.shadowBlur = 0;
+        });
+    }
+
+    if (visualData.region_scores) {
+        for (const region of visualData.region_scores) {
+            const box = region.box;
+            const regionScore = region.region_score;
+            const [x1_px, y1_px, x2_px, y2_px] = box;
+            const x1 = x1_px * scale + offsetX;
+            const y1 = y1_px * scale + offsetY;
+            const x2 = x2_px * scale + offsetX;
+            const y2 = y2_px * scale + offsetY;
+            const w = x2 - x1;
+            const h = y2 - y1;
+            if (w <= 0 || h <= 0) continue;
+
+            const qualityPercent = (regionScore * 100).toFixed(0);
+            const qualityColor = regionScore > 0.5 ? '#ff6666' : '#66ff66';
+            ctx.fillStyle = qualityColor;
+            ctx.fillText(`${t('artifact_confidence')}: ${qualityPercent}%`, x1 + 2, y2 + 16);
+        }
+    }
+}
+
+function attachSuspiciousResizeObserver() {
+    const imgEl = document.getElementById('suspiciousImg');
+    const container = document.querySelector('#suspiciousModal .modal-image');
+    if (!imgEl || !container) return;
+    if (suspiciousResizeObserver) suspiciousResizeObserver.disconnect();
+    suspiciousResizeObserver = new ResizeObserver(() => {
+        if (!suspiciousZoomActive) {
+            const item = suspiciousList[suspiciousIndex];
+            if (item) drawBoundingBoxes(imgEl, item.visual_data || {});
+        }
+    });
+    suspiciousResizeObserver.observe(container);
+}
+
+function suspiciousKeyHandler(e) {
+    if (e.key === 'ArrowLeft') {
+        if (suspiciousIndex > 0) {
+            suspiciousIndex--;
+            loadSuspiciousItem(suspiciousIndex);
+        }
+    } else if (e.key === 'ArrowRight') {
+        if (suspiciousIndex < suspiciousList.length - 1) {
+            suspiciousIndex++;
+            loadSuspiciousItem(suspiciousIndex);
+        }
+    } else if (e.key === 'Escape') {
+        closeSuspiciousModalAndMarkAllGood();
+    }
+}
+
+function closeSuspiciousModal() {
+    const modalDiv = document.getElementById('suspiciousModal');
+    if (modalDiv) modalDiv.classList.remove('show');
+    if (suspiciousResizeObserver) {
+        suspiciousResizeObserver.disconnect();
+        suspiciousResizeObserver = null;
+    }
+    const canvas = document.getElementById('suspiciousCanvas');
+    if (canvas) {
+        const ctx = canvas.getContext('2d');
+        if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+        canvas.style.opacity = '1';
+    }
+    document.removeEventListener('keydown', suspiciousKeyHandler);
+}
+
+async function handleSuspiciousDecision(decision) {
+    const item = suspiciousList[suspiciousIndex];
+    if (!item) return;
+    if (decision === 'bad') {
+        const resp = await fetch('/api/semantic/mark-bad', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ filename: item.filename })
+        });
+        if (!resp.ok) alert('Ошибка перемещения');
+    } else {
+        await fetch('/api/semantic/mark-good', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ filename: item.filename })
+        });
+    }
+    suspiciousList.splice(suspiciousIndex, 1);
+    if (suspiciousList.length === 0) {
+        closeSuspiciousModal();
+    } else {
+        if (suspiciousIndex >= suspiciousList.length) suspiciousIndex = suspiciousList.length - 1;
+        loadSuspiciousItem(suspiciousIndex);
+    }
+}
+
+function attachSuspiciousHandlers() {
+    const goodBtn = document.getElementById('suspiciousGoodBtn');
+    const badBtn = document.getElementById('suspiciousBadBtn');
+    if (goodBtn) goodBtn.onclick = () => handleSuspiciousDecision('good');
+    if (badBtn) badBtn.onclick = () => handleSuspiciousDecision('bad');
+}
 
 function showDeleteConfirm(filename) {
     pendingDeleteFilename = filename;
@@ -411,6 +1451,11 @@ async function loadSettings() {
     if (wdInput && settings.working_directory !== undefined) {
         wdInput.value = settings.working_directory;
     }
+
+    const batchSizeInput = document.getElementById('batchSizeInput');
+    if (batchSizeInput && settings.batch_size !== undefined) {
+        batchSizeInput.value = settings.batch_size;
+    }
 }
 
 function adjustColor(hex, percent) {
@@ -429,6 +1474,11 @@ function startAutoStatusPolling() {
         const statusResp = await fetch('/api/auto-tag/status');
         const status = await statusResp.json();
         updateAutoProgressUI(status);
+        if (status.error) {
+            alert(status.error);
+            stopAutoStatusPolling();
+            updateAutoButtonsUI();
+        }
         if (!status.running) {
             autoTaggingActive = false;
             stopAutoStatusPolling();
@@ -449,12 +1499,24 @@ function updateAutoProgressUI(status) {
     const progressFill = document.getElementById('progressFill');
     const currentFileEl = document.getElementById('currentFile');
     if (!progressContainer) return;
-    if (status.total > 0) {
-        const percent = (status.processed / status.total) * 100;
-        progressFill.style.width = percent + '%';
-        currentFileEl.textContent = status.current_file || t('idle');
+
+    if (status.running) {
+        progressContainer.style.display = 'block';
+        if (status.loading_model) {
+            currentFileEl.textContent = 'Загрузка модели...';
+            progressFill.style.width = '0%';
+        } else if (status.total > 0) {
+            const percent = (status.processed / status.total) * 100;
+            progressFill.style.width = percent + '%';
+            if (status.current_file === 'Подготовка к обработке...') {
+                currentFileEl.textContent = status.current_file;
+            } else {
+                currentFileEl.textContent = status.current_file || t('idle');
+            }
+        }
+    } else {
+        progressContainer.style.display = 'none';
     }
-    progressContainer.style.display = status.running ? 'block' : 'none';
 }
 
 function updateAutoButtonsUI() {
@@ -488,6 +1550,10 @@ function stopRatingPolling() {
 function updateRatingProgress(status) {
     const container = document.getElementById('ratingProgressContainer');
     if (!container) return;
+
+    const wasRunning = ratingRunning;
+    ratingRunning = status.running && status.total > 0;
+
     if (status.running && status.total > 0) {
         container.style.display = 'flex';
         const fill = document.getElementById('ratingProgressFill');
@@ -496,6 +1562,42 @@ function updateRatingProgress(status) {
         fill.style.width = percent + '%';
         current.textContent = status.current_file || '';
     }
+
+    if (wasRunning !== ratingRunning) {
+        const activeTab = document.querySelector('.tab-button.active');
+        if (activeTab && activeTab.dataset.tab === 'mass') {
+            updateMassButtonsState(ratingRunning);
+        }
+    }
+}
+
+function updateMassButtonsState(disable) {
+    const buttonIds = [
+        'bulkRenameBtn',
+        'bulkDeleteBtn',
+        'bulkAddBtn',
+        'bulkReplaceBtn',
+        'backupBtn',
+        'startAutoBtn',
+        'stopAutoBtn',
+        'startSemanticBtn',
+        'stopSemanticBtn',
+        'trainModelBtn',
+        'startCropBtn',
+        'stopCropBtn',
+        'startAnalyzeBtn'
+    ];
+
+    buttonIds.forEach(id => {
+        const btn = document.getElementById(id);
+        if (btn) btn.disabled = disable;
+    });
+
+    const extraSelectors = [
+        '#trainModelBtn',
+        '.mass-panel .btn-primary',
+        '.mass-panel .btn-secondary'
+    ];
 }
 
 function showRatingComplete() {
@@ -547,8 +1649,13 @@ function renderTab(tabName) {
         mainContent.innerHTML = getMassHTML();
         attachMassHandlers();
         loadModels();
+        populateYoloSelects();
+        loadYoloModels();
         attachAutoHandlersToMass();
+        attachSemanticHandlers();
+        loadUserModels();
         initCustomSelects();
+        updateMassButtonsState(ratingRunning);
 
         if (autoTaggingActive) {
             startAutoStatusPolling();
@@ -620,6 +1727,226 @@ function renderTab(tabName) {
 function getMassHTML() {
     return `
         <div style="display: flex; flex-wrap: wrap; gap: 20px;">
+            <!-- Карточка Auto crop -->
+            <div class="mass-panel" style="flex: 1 1 400px;">
+                <h3 data-i18n="auto_crop_card">Auto crop</h3>
+                <div class="form-group">
+                    <label data-i18n="crop_folder">Папка для кропов</label>
+                    <input type="text" id="cropFolderName" class="mass-input" placeholder="cropped_parts">
+                </div>
+                <div class="form-group">
+                    <label data-i18n="yolo_model_select">YOLO модель</label>
+                    <select id="cropModelSelect" class="custom-select"></select>
+                </div>
+                <div class="form-group">
+                    <label data-i18n="yolo_model_threshold">Порог уверенности: <span id="cropThresholdValue">0.5</span></label>
+                    <input type="range" id="cropThresholdSlider" min="0" max="1" step="0.01" value="0.5">
+                </div>
+                <div class="button-group">
+                    <button id="startCropBtn" class="btn-primary" data-i18n="start">Запустить кроппинг</button>
+                    <button id="stopCropBtn" class="btn-secondary" data-i18n="stop" disabled>Остановить</button>
+                </div>
+                <div id="cropProgressContainer" style="margin-top:20px; display:none;">
+                    <div class="progress-bar"><div id="cropProgressFill" style="width:0%"></div></div>
+                    <p id="cropCurrentFile"></p>
+                </div>
+            </div>
+
+            <!-- Карточка автотеггинга -->
+            <div class="mass-panel" style="flex: 1 1 400px;">
+                <h3 data-i18n="auto_tagging">Автоматическое тегирование</h3>
+                <div class="form-group">
+                    <label data-i18n="model">Модель</label>
+                    <select id="modelSelect" class="custom-select"></select>
+                </div>
+                <div class="form-group">
+                    <label>
+                        <span data-i18n="threshold">Порог уверенности:</span>
+                        <span id="thresholdValue">0.35</span>
+                    </label>
+                    <input type="range" id="thresholdSlider" min="0" max="1" step="0.01" value="0.35">
+                </div>
+                <div class="form-group">
+                    <label data-i18n="mode">Режим</label>
+                    <select id="modeSelect" class="custom-select">
+                        <option value="append" data-i18n="append_mode">Добавить к существующим</option>
+                        <option value="replace" data-i18n="replace_mode">Заменить все теги</option>
+                        <option value="add_if_empty" data-i18n="add_if_empty_mode">Только для изображений без тегов</option>
+                    </select>
+                </div>
+                <div class="button-group">
+                    <button id="startAutoBtn" class="btn-primary" data-i18n="start">Запустить</button>
+                    <button id="stopAutoBtn" class="btn-secondary" disabled data-i18n="stop">Остановить</button>
+                </div>
+
+                <div id="progressContainer" style="margin-top:20px; display:none;">
+                    <div class="progress-bar"><div id="progressFill" style="width:0%"></div></div>
+                    <p id="currentFile"></p>
+                </div>
+            </div>
+
+            <!-- Карточка семантического фильтра -->
+            <div class="mass-panel" style="flex: 1 1 400px;">
+                <h3 data-i18n="semantic_filter">Семантический фильтр</h3>
+
+                <!-- Аккордеон 1: YOLO детекторы -->
+                <div class="expandable-section">
+                    <div class="section-header" data-toggle="yolo-section">
+                        <span class="section-title" data-i18n="yolo_detectors">YOLO детекторы</span>
+                        <span class="toggle-icon">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <polyline points="6 9 12 15 18 9"></polyline>
+                            </svg>
+                        </span>
+                    </div>
+                    <div class="section-content" id="yolo-section">
+                        <!-- Руки -->
+                        <div class="form-group">
+                            <label data-i18n="yolo_model_for_hands">YOLO модель для рук</label>
+                            <div style="display: flex; gap: 8px;">
+                                <select id="yoloHandsModelSelect" class="custom-select" style="flex: 1;">
+                                    <option value="">-- Не использовать --</option>
+                                </select>
+                                <input type="number" id="yoloHandsThreshold" class="yolo-threshold" step="0.01" min="0.01" max="1" value="0.5" style="width: 80px;" placeholder="порог">
+                            </div>
+                        </div>
+                        <!-- Лица -->
+                        <div class="form-group">
+                            <label data-i18n="yolo_model_for_face">YOLO модель для лиц</label>
+                            <div style="display: flex; gap: 8px;">
+                                <select id="yoloFaceModelSelect" class="custom-select" style="flex: 1;">
+                                    <option value="">-- Не использовать --</option>
+                                </select>
+                                <input type="number" id="yoloFaceThreshold" class="yolo-threshold" step="0.01" min="0.01" max="1" value="0.5" style="width: 80px;" placeholder="порог">
+                            </div>
+                        </div>
+                        <!-- Глаза -->
+                        <div class="form-group">
+                            <label data-i18n="yolo_model_for_eyes">YOLO модель для глаз</label>
+                            <div style="display: flex; gap: 8px;">
+                                <select id="yoloEyesModelSelect" class="custom-select" style="flex: 1;">
+                                    <option value="">-- Не использовать --</option>
+                                </select>
+                                <input type="number" id="yoloEyesThreshold" class="yolo-threshold" step="0.01" min="0.01" max="1" value="0.5" style="width: 80px;" placeholder="порог">
+                            </div>
+                        </div>
+                        <!-- Ступни -->
+                        <div class="form-group">
+                            <label data-i18n="yolo_model_for_feet">YOLO модель для ступней</label>
+                            <div style="display: flex; gap: 8px;">
+                                <select id="yoloFeetModelSelect" class="custom-select" style="flex: 1;">
+                                    <option value="">-- Не использовать --</option>
+                                </select>
+                                <input type="number" id="yoloFeetThreshold" class="yolo-threshold" step="0.01" min="0.01" max="1" value="0.5" style="width: 80px;" placeholder="порог">
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Аккордеон 2: Пользовательские классификаторы -->
+                <div class="expandable-section">
+                    <div class="section-header" data-toggle="user-models-section">
+                        <span class="section-title" data-i18n="classifiers">Классификаторы</span>
+                        <span class="toggle-icon">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <polyline points="6 9 12 15 18 9"></polyline>
+                            </svg>
+                        </span>
+                    </div>
+                    <div class="section-content" id="user-models-section">
+                        <div class="form-group">
+                            <label data-i18n="model_for_hands">Модель для рук</label>
+                            <select id="userModelHandsSelect" class="custom-select">
+                                <option value="">-- Без модели --</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label data-i18n="model_for_face">Модель для лиц</label>
+                            <select id="userModelFaceSelect" class="custom-select">
+                                <option value="">-- Без модели --</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label data-i18n="model_for_eyes">Модель для глаз</label>
+                            <select id="userModelEyesSelect" class="custom-select">
+                                <option value="">-- Без модели --</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label data-i18n="model_for_feet">Модель для ступней</label>
+                            <select id="userModelFeetSelect" class="custom-select">
+                                <option value="">-- Без модели --</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <button id="trainModelBtn" class="btn-primary" data-i18n="train_classifier" style="width: 100%;">Обучить классификатор</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Аккордеон 3: Автотеггер для контекста -->
+                <div class="expandable-section">
+                    <div class="section-header" data-toggle="auto-tagger-section">
+                        <span class="section-title" data-i18n="auto_tagger_context">Автотеггер для контекста</span>
+                        <span class="toggle-icon">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <polyline points="6 9 12 15 18 9"></polyline>
+                            </svg>
+                        </span>
+                    </div>
+                    <div class="section-content" id="auto-tagger-section">
+                        <div class="form-group">
+                            <label data-i18n="auto_tagger_model">Модель автотеггера</label>
+                            <select id="autoTaggerModelSelect" class="custom-select"></select>
+                        </div>
+                        <div class="form-group">
+                            <label><span data-i18n="auto_tagger_threshold">Порог автотеггера</span> <span id="autoTaggerThresholdValue">0.35</span></label>
+                            <input type="range" id="autoTaggerThresholdSlider" min="0" max="1" step="0.01" value="0.35">
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Остальные элементы (энкодер, общие пороги, кнопки) -->
+                <div class="form-group">
+                    <label data-i18n="encoder_for_semantic">Энкодер (для семантики)</label>
+                    <select id="encoderSelect" class="custom-select">
+                        <option value="">${t('no_semantic')}</option>
+                        <option value="clip">CLIP</option>
+                        <option value="dinov2">DINOv2</option>
+                    </select>
+                </div>
+                <div class="form-group" id="encoderModelGroup" style="display: none;">
+                    <label data-i18n="encoder_model">Модель энкодера</label>
+                    <select id="encoderModelSelect" class="custom-select"></select>
+                </div>
+
+                <div class="form-group">
+                    <label><span data-i18n="auto_threshold">Автоматический порог:</span> <span id="autoThresholdValue">0.85</span></label>
+                    <input type="range" id="autoThresholdSlider" min="0" max="1" step="0.01" value="0.90">
+                </div>
+                <div class="form-group">
+                    <label><span data-i18n="suspicious_threshold">Порог для спорных:</span> <span id="suspiciousThresholdValue">0.70</span></label>
+                    <input type="range" id="suspiciousThresholdSlider" min="0" max="1" step="0.01" value="0.70">
+                </div>
+
+                <!-- Новый слайдер для зоны неопределённости CLIP -->
+                <div class="form-group">
+                    <label><span data-i18n="clip_uncertainty_margin">Зона неопределённости CLIP:</span> <span id="uncertaintyMarginValue">0.10</span></label>
+                    <input type="range" id="uncertaintyMarginSlider" min="0" max="0.2" step="0.02" value="0.1">
+                    <small data-i18n="clip_uncertainty_help">Оценки CLIP в диапазоне 0.5 ± (значение/2) игнорируются</small>
+                </div>
+
+                <div class="button-group">
+                    <button id="startSemanticBtn" class="btn-primary" data-i18n="start_filter">Запустить фильтр</button>
+                    <button id="stopSemanticBtn" class="btn-secondary" disabled data-i18n="stop_filter">Остановить</button>
+                </div>
+
+                <div id="semanticProgressContainer" style="margin-top:20px; display:none;">
+                    <div class="progress-bar"><div id="semanticProgressFill" style="width:0%"></div></div>
+                    <p id="semanticCurrentFile"></p>
+                </div>
+            </div>
+
             <!-- Карточка массовых операций -->
             <div class="mass-panel" style="flex: 1 1 400px;">
                 <h3 data-i18n="mass_edit_title">Массовое редактирование</h3>
@@ -659,39 +1986,6 @@ function getMassHTML() {
                 <div id="backupProgressContainer" style="margin-top:20px; display:none;">
                     <div class="progress-bar"><div id="backupProgressFill" style="width:0%"></div></div>
                     <p id="backupCurrentFile"></p>
-                </div>
-            </div>
-
-            <!-- Карточка автотеггинга -->
-            <div class="mass-panel" style="flex: 1 1 400px;">
-                <h3 data-i18n="auto_tagging">Автоматическое тегирование</h3>
-                <div class="form-group">
-                    <label data-i18n="model">Модель</label>
-                    <select id="modelSelect" class="custom-select"></select>
-                </div>
-                <div class="form-group">
-                    <label>
-                        <span data-i18n="threshold">Порог уверенности:</span>
-                        <span id="thresholdValue">0.35</span>
-                    </label>
-                    <input type="range" id="thresholdSlider" min="0" max="1" step="0.01" value="0.35">
-                </div>
-                <div class="form-group">
-                    <label data-i18n="mode">Режим</label>
-                    <select id="modeSelect" class="custom-select">
-                        <option value="append" data-i18n="append_mode">Добавить к существующим</option>
-                        <option value="replace" data-i18n="replace_mode">Заменить все теги</option>
-                        <option value="add_if_empty" data-i18n="add_if_empty_mode">Только для изображений без тегов</option>
-                    </select>
-                </div>
-                <div class="button-group">
-                    <button id="startAutoBtn" class="btn-primary" data-i18n="start">Запустить</button>
-                    <button id="stopAutoBtn" class="btn-secondary" disabled data-i18n="stop">Остановить</button>
-                </div>
-
-                <div id="progressContainer" style="margin-top:20px; display:none;">
-                    <div class="progress-bar"><div id="progressFill" style="width:0%"></div></div>
-                    <p id="currentFile"></p>
                 </div>
             </div>
         </div>
@@ -858,6 +2152,9 @@ function getSettingsHTML() {
             <input type="text" id="workingDirectoryInput" placeholder="/path/to/workspace" value="">
 
             <h3 data-i18n="server_settings">Настройки сервера</h3>
+            <div id="qrCodeContainer" style="display: none; margin-top: 20px; margin-bottom: 10px; text-align: center">
+                <img id="qrCodeImg" src="" alt="QR Code" style="max-width: 200px; border-radius: 16px; display: inline-block;">
+            </div>
             <div class="form-group">
                 <label data-i18n="server_host">IP-адрес (по умолчанию 127.0.0.1)</label>
                 <input type="text" id="serverHostInput" placeholder="127.0.0.1" value="">
@@ -878,6 +2175,15 @@ function getSettingsHTML() {
             <div class="form-group">
                 <label data-i18n="zoom_factor">Коэффициент увеличения:</label>
                 <input type="number" id="zoomFactorInput" min="1" max="5" step="0.5" value="2">
+            </div>
+
+            <hr style="margin: 24px 0; border: 1px solid var(--border-color);">
+
+            <h3 data-i18n="optimize_settings_title">Оптимиизация</h3>
+            <div class="form-group">
+                <label data-i18n="optimize_batch_size">Размер батча</label>
+                <input type="number" id="batchSizeInput" min="1" max="128" step="1" value="8">
+                <small data-i18n="optimize_help_label">Для мощных GPU можно увеличить (например, 16-32). Слишком большое значение может вызвать ошибку памяти.</small>
             </div>
 
             <hr style="margin: 24px 0; border: 1px solid var(--border-color);">
@@ -918,7 +2224,6 @@ async function refreshTagList() {
         renderTagList(tags);
     }
 }
-
 
 async function loadTagsAndImages() {
     const tagsResp = await fetch('/api/get-tags');
@@ -1781,6 +3086,28 @@ function toggleTagInCaption(tag) {
     }
 }
 
+async function updateQRCode() {
+    const container = document.getElementById('qrCodeContainer');
+    const img = document.getElementById('qrCodeImg');
+    if (!container || !img) return;
+    try {
+        const resp = await fetch('/api/qr-code');
+        if (resp.status === 200) {
+            const blob = await resp.blob();
+            const url = URL.createObjectURL(blob);
+            img.src = url;
+            container.style.display = 'block';
+            img.onload = () => URL.revokeObjectURL(url);
+        } else {
+            container.style.display = 'none';
+            img.src = '';
+        }
+    } catch (e) {
+        console.error('QR error:', e);
+        container.style.display = 'none';
+    }
+}
+
 async function saveCaptionWithoutUI(caption) {
     const img = currentImages[currentImageIndex];
     if (!img) return;
@@ -1930,15 +3257,24 @@ navInput.addEventListener('change', () => {
 function attachMassHandlers() {
     document.getElementById('bulkRenameBtn')?.addEventListener('click', async () => {
         if (!confirm(t('confirm_rename'))) return;
-        await fetch('/api/bulk-rename', { method: 'POST' });
+        const currentPath = '';
+        const resp = await fetch('/api/bulk-rename', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: currentPath })
+        });
+        if (!resp.ok) {
+            const errorData = await resp.json();
+            alert('Ошибка: ' + (errorData.error || 'Неизвестная ошибка'));
+            return;
+        }
         alert(t('rename_complete'));
-
         await reloadDuplicateData();
-
-        if (document.querySelector('.tab-button.active').dataset.tab === 'point') {
+        const activeTab = document.querySelector('.tab-button.active').dataset.tab;
+        if (activeTab === 'point') {
             await refreshTagList();
             loadTagsAndImages();
-        } else if (document.querySelector('.tab-button.active').dataset.tab === 'analysis') {
+        } else if (activeTab === 'analysis') {
             refreshAnalysis();
         }
     });
@@ -1979,7 +3315,6 @@ function attachMassHandlers() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ tags })
         });
-        alert(t('delete_complete'));
         document.getElementById('deleteTagsInput').value = '';
         if (document.querySelector('.tab-button.active').dataset.tab === 'point') {
             await refreshTagList();
@@ -2021,7 +3356,6 @@ function attachMassHandlers() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ old_tag: oldTag, new_tag: newTag })
         });
-        alert(t('replace_complete'));
         document.getElementById('replaceOldInput').value = '';
         document.getElementById('replaceNewInput').value = '';
         if (document.querySelector('.tab-button.active').dataset.tab === 'point') {
@@ -2051,6 +3385,121 @@ function attachMassHandlers() {
         const status = await statusResp.json();
         updateBackupProgressUI(status);
     });
+
+    async function loadCropModels() {
+        const resp = await fetch('/api/semantic/yolo-models');
+        const models = await resp.json();
+        const select = document.getElementById('cropModelSelect');
+        if (!select) return;
+        select.innerHTML = '';
+        models.forEach(m => {
+            const option = document.createElement('option');
+            option.value = m;
+            option.textContent = m;
+            select.appendChild(option);
+        });
+        refreshCustomSelect('#cropModelSelect');
+    }
+    loadCropModels();
+
+    const cropThresholdSlider = document.getElementById('cropThresholdSlider');
+    const cropThresholdSpan = document.getElementById('cropThresholdValue');
+    if (cropThresholdSlider && cropThresholdSpan) {
+        const updateCropThreshold = () => {
+            cropThresholdSpan.textContent = cropThresholdSlider.value;
+            const percent = ((cropThresholdSlider.value - cropThresholdSlider.min) / (cropThresholdSlider.max - cropThresholdSlider.min) * 100);
+            cropThresholdSlider.style.setProperty('--fill-percent', percent + '%');
+        };
+        updateCropThreshold();
+        cropThresholdSlider.addEventListener('input', updateCropThreshold);
+    }
+
+    const startCropBtn = document.getElementById('startCropBtn');
+    const stopCropBtn = document.getElementById('stopCropBtn');
+
+    startCropBtn?.addEventListener('click', async () => {
+        const folder = document.getElementById('cropFolderName').value.trim();
+        const model = document.getElementById('cropModelSelect').value;
+        const threshold = parseFloat(cropThresholdSlider.value);
+        if (!folder) {
+            alert('Укажите название папки для кропов');
+            return;
+        }
+        if (!model) {
+            alert('Выберите YOLO модель');
+            return;
+        }
+        const resp = await fetch('/api/auto-crop/start', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ folder, model, threshold })
+        });
+        const data = await resp.json();
+        if (data.error) {
+            alert(data.error);
+            return;
+        }
+        cropActive = true;
+        startCropPolling();
+        updateCropButtons();
+    });
+
+    stopCropBtn?.addEventListener('click', async () => {
+        await fetch('/api/auto-crop/stop', { method: 'POST' });
+        cropActive = false;
+        stopCropPolling();
+        updateCropButtons();
+        const container = document.getElementById('cropProgressContainer');
+        if (container) container.style.display = 'none';
+    });
+
+    function startCropPolling() {
+        if (cropInterval) return;
+        cropInterval = setInterval(async () => {
+            const resp = await fetch('/api/auto-crop/status');
+            const status = await resp.json();
+            updateCropProgress(status);
+            if (!status.running) {
+                cropActive = false;
+                stopCropPolling();
+                updateCropButtons();
+                if (status.error) alert('Ошибка: ' + status.error);
+            }
+        }, 500);
+    }
+
+    function stopCropPolling() {
+        if (cropInterval) {
+            clearInterval(cropInterval);
+            cropInterval = null;
+        }
+    }
+
+    function updateCropProgress(status) {
+        const container = document.getElementById('cropProgressContainer');
+        const fill = document.getElementById('cropProgressFill');
+        const current = document.getElementById('cropCurrentFile');
+        if (!container) return;
+        if (status.running) {
+            container.style.display = 'block';
+            const percent = status.total > 0 ? (status.processed / status.total) * 100 : 0;
+            fill.style.width = '0%';
+            void fill.offsetWidth;
+            fill.style.width = percent + '%';
+            current.textContent = status.current_file || '';
+        } else {
+            container.style.display = 'none';
+        }
+    }
+
+    function updateCropButtons() {
+        const startBtn = document.getElementById('startCropBtn');
+        const stopBtn = document.getElementById('stopCropBtn');
+        if (startBtn) startBtn.disabled = cropActive;
+        if (stopBtn) stopBtn.disabled = !cropActive;
+    }
+
+    updateMassButtonsState(ratingRunning);
 }
 
 async function loadAnalysisData() {
@@ -2145,6 +3594,106 @@ function setupZoom() {
     modalImageContainer.addEventListener('mouseleave', onZoomLeave);
 }
 
+function setupSuspiciousZoom() {
+    const modal = document.getElementById('suspiciousModal');
+    if (!modal) return;
+    const container = modal.querySelector('.modal-image');
+    const img = modal.querySelector('#suspiciousImg');
+    if (!container || !img) return;
+
+    container.removeEventListener('mouseenter', onSuspiciousZoomEnter);
+    container.removeEventListener('mousemove', onSuspiciousZoomMove);
+    container.removeEventListener('mouseleave', onSuspiciousZoomLeave);
+
+    if (!zoomEnabled) return;
+
+    let zoomTransitionTimeout = null;
+
+    function onSuspiciousZoomEnter(e) {
+        if (!img.complete) return;
+        suspiciousZoomActive = true;
+
+        if (zoomTransitionTimeout) {
+            clearTimeout(zoomTransitionTimeout);
+            zoomTransitionTimeout = null;
+        }
+
+        const canvas = modal.querySelector('#suspiciousCanvas');
+        if (canvas) canvas.style.opacity = '0';
+        container.classList.add('zoomed');
+        updateSuspiciousZoomTransform(e, zoomFactor);
+    }
+
+    function onSuspiciousZoomMove(e) {
+        if (!suspiciousZoomActive) return;
+        updateSuspiciousZoomTransform(e, zoomFactor);
+    }
+
+    function onSuspiciousZoomLeave() {
+        suspiciousZoomActive = false;
+
+        const modal = document.getElementById('suspiciousModal');
+        if (!modal) return;
+        const container = modal.querySelector('.modal-image');
+        const img = modal.querySelector('#suspiciousImg');
+        const canvas = modal.querySelector('#suspiciousCanvas');
+        if (!container || !img) return;
+
+        container.classList.remove('zoomed');
+        img.style.transform = '';
+
+        if (canvas) {
+            canvas.style.opacity = '0';
+            canvas.width = 0;
+            canvas.height = 0;
+        }
+        const onTransitionEnd = () => {
+            img.removeEventListener('transitionend', onTransitionEnd);
+
+            requestAnimationFrame(() => {
+                requestAnimationFrame(() => {
+                    if (!suspiciousZoomActive) {
+                        const item = suspiciousList[suspiciousIndex];
+                        if (item && img && img.complete && img.naturalWidth > 0) {
+                            drawBoundingBoxes(img, item.visual_data || {});
+                            if (canvas) canvas.style.opacity = '1';
+                        } else if (canvas) {
+                            canvas.style.opacity = '1';
+                        }
+                    }
+                    zoomTransitionTimeout = null;
+                });
+            });
+        };
+
+        img.addEventListener('transitionend', onTransitionEnd, { once: true });
+
+        zoomTransitionTimeout = setTimeout(() => {
+            img.removeEventListener('transitionend', onTransitionEnd);
+            onTransitionEnd();
+        }, 300);
+    }
+
+    function updateSuspiciousZoomTransform(e, factor) {
+        const rect = img.getBoundingClientRect();
+        let x = e.clientX - rect.left;
+        let y = e.clientY - rect.top;
+
+        x = Math.max(0, Math.min(rect.width, x));
+        y = Math.max(0, Math.min(rect.height, y));
+
+        const percentX = (x / rect.width) * 100;
+        const percentY = (y / rect.height) * 100;
+
+        img.style.transformOrigin = `${percentX}% ${percentY}%`;
+        img.style.transform = `scale(${factor})`;
+    }
+
+    container.addEventListener('mouseenter', onSuspiciousZoomEnter);
+    container.addEventListener('mousemove', onSuspiciousZoomMove);
+    container.addEventListener('mouseleave', onSuspiciousZoomLeave);
+}
+
 function onZoomEnter(e) {
     const container = e.currentTarget;
     const img = container.querySelector('img');
@@ -2198,14 +3747,40 @@ function attachSettingsHandlers() {
     const zoomFactorInput = document.getElementById('zoomFactorInput');
     const serverHostInput = document.getElementById('serverHostInput');
     const serverPortInput = document.getElementById('serverPortInput');
+    const batchSizeInput = document.getElementById('batchSizeInput');
 
-    (async () => {
+    async function refreshSettingsUI() {
         const resp = await fetch('/api/settings');
         const settings = await resp.json();
+
+        if (languageSelect) languageSelect.value = settings.language || 'ru';
+        if (colorPicker) colorPicker.value = settings.accent_color || '#3b82f6';
         if (workingDirInput) workingDirInput.value = settings.working_directory || '';
+        if (zoomEnabledCheck) zoomEnabledCheck.checked = settings.zoom_enabled !== undefined ? settings.zoom_enabled : true;
+        if (zoomFactorInput) zoomFactorInput.value = settings.zoom_factor || 2;
         if (serverHostInput) serverHostInput.value = settings.server_host || '';
         if (serverPortInput) serverPortInput.value = settings.server_port || '';
-    })();
+        if (batchSizeInput) batchSizeInput.value = settings.batch_size || 8;
+
+        document.documentElement.style.setProperty('--accent-color', settings.accent_color);
+        const hoverColor = adjustColor(settings.accent_color, -20);
+        document.documentElement.style.setProperty('--accent-hover', hoverColor);
+        updateGradientVariables(settings.accent_color);
+
+        if (settings.language !== currentLanguage) {
+            currentLanguage = settings.language;
+            await loadTranslations(currentLanguage);
+            applyTranslations();
+            initCustomSelects();
+        }
+
+        zoomEnabled = settings.zoom_enabled;
+        zoomFactor = settings.zoom_factor;
+
+        updateQRCode();
+    }
+
+    refreshSettingsUI();
 
     async function saveAllSettings() {
         const lang = languageSelect.value;
@@ -2215,6 +3790,7 @@ function attachSettingsHandlers() {
         const zoomFactorVal = zoomFactorInput ? parseFloat(zoomFactorInput.value) || 2 : 2;
         let serverHost = serverHostInput ? serverHostInput.value.trim() : '';
         let serverPort = serverPortInput ? serverPortInput.value.trim() : '';
+        const batchSize = batchSizeInput ? parseInt(batchSizeInput.value, 10) || 8 : 8;
 
         if (serverHost && !isValidIP(serverHost)) {
             alert(t('invalid_ip') || 'Введите корректный IP-адрес (например, 127.0.0.1, 0.0.0.0, localhost)');
@@ -2239,22 +3815,15 @@ function attachSettingsHandlers() {
                 zoom_enabled: zoomEnabledVal,
                 zoom_factor: zoomFactorVal,
                 server_host: serverHost,
-                server_port: serverPort
+                server_port: serverPort,
+                batch_size: batchSize
             })
         });
-        zoomEnabled = zoomEnabledVal;
-        zoomFactor = zoomFactorVal;
+
+        await refreshSettingsUI();
     }
 
-    languageSelect.addEventListener('change', async () => {
-        const newLang = languageSelect.value;
-        await saveAllSettings();
-        currentLanguage = newLang;
-        await loadTranslations(currentLanguage);
-        applyTranslations();
-        initCustomSelects();
-    });
-
+    languageSelect.addEventListener('change', saveAllSettings);
     colorPicker.addEventListener('input', (e) => {
         const newColor = e.target.value;
         document.documentElement.style.setProperty('--accent-color', newColor);
@@ -2263,7 +3832,6 @@ function attachSettingsHandlers() {
         updateGradientVariables(newColor);
     });
     colorPicker.addEventListener('change', saveAllSettings);
-
     if (workingDirInput) workingDirInput.addEventListener('change', saveAllSettings);
     if (zoomEnabledCheck && zoomFactorInput) {
         zoomEnabledCheck.addEventListener('change', saveAllSettings);
@@ -2271,6 +3839,7 @@ function attachSettingsHandlers() {
     }
     if (serverHostInput) serverHostInput.addEventListener('change', saveAllSettings);
     if (serverPortInput) serverPortInput.addEventListener('change', saveAllSettings);
+    if (batchSizeInput) batchSizeInput.addEventListener('change', saveAllSettings);
 
     document.getElementById('resetRatingsBtn')?.addEventListener('click', async () => {
         if (!confirm(t('confirm_reset_ratings') || 'Вы уверены? Все сохранённые рейтинги будут удалены.')) return;
@@ -2413,4 +3982,4 @@ function attachAutoHandlersToMass() {
                 updateAnalyzeButtons();
             }
         });
-})();toggleVocabBtn
+})();
