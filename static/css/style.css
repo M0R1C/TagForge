@@ -27,7 +27,6 @@
 body {
     background-color: var(--bg-primary);
     color: var(--text-primary);
-    height: 100vh;
     overflow: hidden;
     line-height: 1.5;
     -webkit-font-smoothing: antialiased;
@@ -399,7 +398,7 @@ body {
 
 .point-layout {
     display: flex;
-    gap: 28px;
+    gap: 16px;
     height: 100%;
 }
 
@@ -412,7 +411,7 @@ body {
     border: 1px solid var(--border-color);
     overflow-y: auto;
     height: fit-content;
-    max-height: calc(100vh - 180px);
+    max-height: calc(100vh - 120px);
     position: sticky;
     top: 0;
     box-shadow: var(--shadow-md);
@@ -426,7 +425,7 @@ body {
     border: 1px solid var(--border-color);
     background-color: var(--bg-tertiary);
     color: var(--text-primary);
-    margin-bottom: 20px;
+    margin-bottom: 8px;
     transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
     box-shadow: inset 0 1px 4px rgba(0,0,0,0.5);
 }
@@ -438,7 +437,7 @@ body {
 
 .tag-list {
     overflow-y: auto;
-    max-height: calc(100vh - 320px);
+    max-height: calc(100vh - 18px);
 }
 
 .tag-item {
@@ -482,6 +481,7 @@ body {
     flex: 1;
     overflow-y: auto;
     padding-top: 8px;
+    padding-right: 2px;
 }
 
 .image-grid {
@@ -699,7 +699,7 @@ body {
 }
 
 .form-group {
-    margin-bottom: 24px;
+    margin-bottom: 16px;
 }
 
 .form-group label {
@@ -824,7 +824,7 @@ body {
     width: 100%;
     display: flex;
     flex-direction: column;
-    gap: 20px;
+    gap: 16px;
     overflow: hidden;
 }
 
@@ -833,6 +833,7 @@ body {
     display: flex;
     flex-wrap: wrap;
     gap: 10px;
+    padding-top: 2px;
 }
 
 .badge {
@@ -1497,7 +1498,7 @@ select.custom-select {
     border-radius: 30px;
     padding: 8px 16px;
     border: 1px solid var(--border-color);
-    height: 48px;
+    height: 44px;
     box-sizing: border-box;
     transition: all 0.3s ease;
     flex-shrink: 0;
@@ -2195,7 +2196,7 @@ select.custom-select {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 20px 28px;
+    padding: 12px 20px;
     border-top: 1px solid var(--border-color);
 }
 
@@ -3772,4 +3773,110 @@ button,
         visibility: visible !important;
         transition: none !important;
     }
+}
+
+#suspiciousCanvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+}
+
+.expandable-section {
+    border-bottom: 1px solid var(--border-color, #e2e8f0);
+    margin-bottom: 12px;
+}
+.section-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 8px;
+    cursor: pointer;
+    font-weight: 500;
+    background-color: var(--bg-secondary, #f8fafc);
+    border-radius: 12px;
+    transition: background 0.2s;
+}
+.section-header:hover {
+    background-color: var(--bg-tertiary, #f1f5f9);
+}
+.section-title {
+    font-size: 1rem;
+}
+.toggle-icon {
+    transition: transform 0.2s;
+}
+.section-header.open .toggle-icon {
+    transform: rotate(180deg);
+}
+.section-content {
+    max-height: 0;
+    overflow: hidden;
+    transition: max-height 0.3s ease-out;
+    padding: 0 8px;
+    display: block;
+}
+.section-content.open {
+    max-height: 500px;
+    padding: 12px 8px 8px 8px;
+}
+
+#semanticProgressFill {
+    height: 100%;
+    background: linear-gradient(135deg, var(--accent-gradient-start), var(--accent-gradient-end));
+    width: 0%;
+    transition: width 0.3s ease;
+    border-radius: 20px;
+    box-shadow: 0 0 10px var(--accent-color);
+}
+
+
+
+#suspiciousModal .modal-body > div:first-child {
+    cursor: default !important;
+}
+
+
+
+#suspiciousModal .modal-footer .btn-primary,
+#suspiciousModal .modal-footer .btn-danger {
+    border-radius: 16px;
+    padding: 12px 28px;
+    min-width: 120px;
+    font-size: 15px;
+}
+
+
+#suspiciousModal .modal-footer .btn-danger {
+    background: linear-gradient(135deg, #ef4444, #dc2626);
+}
+
+
+#trainModal .btn-primary,
+#trainModal .btn-secondary {
+    border-radius: 30px !important;
+    width: auto;
+}
+
+.section-content.open {
+    overflow: visible;
+}
+
+.custom-select-options {
+    z-index: 1100;
+}
+
+#cropProgressFill {
+    height: 100%;
+    background: linear-gradient(135deg, var(--accent-gradient-start), var(--accent-gradient-end));
+    width: 0%;
+    transition: width 0.3s ease;
+    border-radius: 20px;
+    box-shadow: 0 0 10px var(--accent-color);
+}
+
+#suspiciousCanvas {
+    transition: opacity 0.2s ease;
 }
