@@ -20,8 +20,14 @@ for /f "tokens=2" %%i in ('python --version 2^>^&1') do set pyver=%%i
 echo Python version found: %pyver%
 echo.
 
-if not exist requirements.txt (
-    echo [ERROR] File requirements.txt not found in the current folder.
+if not exist requirements-base.txt (
+    echo [ERROR] File requirements-base.txt not found in the current folder.
+    pause
+    exit /b 1
+)
+
+if not exist requirements-torch.txt (
+    echo [ERROR] File requirements-torch.txt not found in the current folder.
     pause
     exit /b 1
 )
@@ -38,7 +44,7 @@ if not exist venv\Scripts\python.exe (
     echo The virtual environment already exists.
 )
 
-echo Installing dependencies from requirements.txt ...
+echo Activating virtual environment...
 call venv\Scripts\activate.bat
 if errorlevel 1 (
     echo [ERROR] The virtual environment could not be activated.
@@ -46,10 +52,21 @@ if errorlevel 1 (
     exit /b 1
 )
 
+echo Upgrading pip...
 python -m pip install --upgrade pip >nul
-pip install -r requirements.txt
+
+echo Installing PyTorch (nightly for sm_120)...
+pip install -r requirements-torch.txt
 if errorlevel 1 (
-    echo [ERROR] Error when installing dependencies.
+    echo [ERROR] Failed to install PyTorch.
+    pause
+    exit /b 1
+)
+
+echo Installing other dependencies...
+pip install -r requirements-base.txt
+if errorlevel 1 (
+    echo [ERROR] Failed to install base dependencies.
     pause
     exit /b 1
 )
