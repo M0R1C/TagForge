@@ -47,3 +47,7 @@ If you find a bug, have ideas for new features, or would like to help with trans
 # Acknowledgments
 
 [SmilingWolf](https://huggingface.co/SmilingWolf) - for the pre‑trained models used in this tool.
+[Pitpe11](https://civitai.com/user/Pitpe11) - for hand YOLO model.
+[99coins](https://civitai.com/user/99coins) - for face YOLO model.
+[SnowyYukino](https://civitai.com/user/SnowyYukino) - for eyes YOLO model.
+[Spoony](https://civitai.com/user/Spoony) - for feet YOLO model.
