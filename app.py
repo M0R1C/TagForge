@@ -1,596 +1,78 @@
 import os
 import re
 import shutil
-import threading
-from collections import Counter
-from utils import get_file_hash, get_image_files, get_caption_path, natural_key
-import concurrent.futures
-import multiprocessing
-import socket
-from multiprocessing import Manager
-from datetime import datetime
-from werkzeug.utils import secure_filename
-import hashlib
-from flask import Flask, request, jsonify, send_file, render_template
-from PIL import Image
-from collections import OrderedDict
 import json
-from database import (
-    DB_PATH,
-    save_global_widget_layout, get_global_widget_layout, clear_all_analysis_data,
-    get_setting, get_all_translations, set_setting, init_db, add_flag,
-    save_dataset_vocabulary, get_dataset_vocabulary, save_image_rating,
-    get_image_rating_and_hash, get_all_ratings_for_dataset,
-    get_all_flags, rename_flag, delete_flag, get_image_rating, delete_image_quality,
-    get_image_quality, update_duplicate_groups, update_similar_pairs,
-    remove_from_duplicate_groups, remove_from_similar_pairs, rename_file_in_similar_pairs,
-    rename_file_in_duplicate_groups, rename_folder_prefix_in_db, get_version_stats
+import threading
+from datetime import datetime
+from flask import Flask, request, jsonify, send_file, render_template
+from werkzeug.utils import secure_filename
+from app_context import AppContext
+from routes import all_blueprints
+from database import get_setting, init_db
+from utils import (
+    safe_join, natural_key, get_working_directory, get_image_files,
+    get_caption_path, read_caption, parse_tags, get_file_hash,
+    get_server_ips, is_port_available
 )
 import sqlite3
-from auto_tag import AutoTagger
-from image_analyzer import ImageAnalyzer
 
 app = Flask(__name__)
 app.json.sort_keys = False
 
+context = AppContext()
+app.config['CONTEXT'] = context
+
+for bp in all_blueprints:
+    bp.context = context
+    app.register_blueprint(bp)
+
 init_db()
 
-current_dataset_path = None
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-auto_tag_status = {
-    'running': False,
-    'total': 0,
-    'processed': 0,
-    'current_file': '',
-    'model_name': ''
-}
-auto_tag_lock = threading.Lock()
-tagger = AutoTagger(models_dir='models')
-
-analyzer_status = {
-    'running': False
-}
-analyzer_lock = threading.Lock()
-analyzer = ImageAnalyzer()
-
-backup_status = {
-    'running': False,
-    'total': 0,
-    'processed': 0,
-    'current_file': '',
-    'error': None
-}
-backup_lock = threading.Lock()
-
-rating_status = {
-    'running': False,
-    'total': 0,
-    'processed': 0,
-    'current_file': '',
-    'dataset_path': None
-}
-rating_lock = threading.Lock()
-
-analyzer_progress = None
-analyzer_progress_lock = threading.Lock()
-
-RATING_MODEL = "wd-swinv2-tagger-v3"
-
-def get_file_hash(filepath):
-    sha256 = hashlib.sha256()
-    with open(filepath, 'rb') as f:
-        for block in iter(lambda: f.read(65536), b''):
-            sha256.update(block)
-    return sha256.hexdigest()
-
-def is_port_available(host, port):
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind((host, port))
-            return True
-    except socket.error:
-        return False
-
-def get_image_files(path):
-    valid_ext = ('.jpg', '.jpeg', '.png', '.webp')
-    files = []
-    for f in os.listdir(path):
-        if f.lower().endswith(valid_ext):
-            files.append(f)
-    files.sort(key=natural_key)
-    return files
-
-def get_server_ips():
-    ips = set()
-    ips.add('127.0.0.1')
-    try:
-        hostname = socket.gethostname()
-        ips.add(socket.gethostbyname(hostname))
-        for info in socket.getaddrinfo(hostname, None):
-            addr = info[4][0]
-            if ':' not in addr:
-                ips.add(addr)
-    except:
-        pass
-    return list(ips)
-
-def get_caption_path(image_path):
-    base, _ = os.path.splitext(image_path)
-    return base + '.txt'
-
-def read_caption(txt_path):
-    if os.path.exists(txt_path):
-        with open(txt_path, 'r', encoding='utf-8') as f:
-            return f.read().strip()
-    return ''
-
-def write_caption(txt_path, content):
-    with open(txt_path, 'w', encoding='utf-8') as f:
-        f.write(content)
-
-def parse_tags(caption):
-    if not caption:
-        return []
-    tags = [tag.strip() for tag in caption.split(',') if tag.strip()]
-    return tags
-
-def get_working_directory():
-    raw_path = get_setting('working_directory', '')
-    if not raw_path:
-        return None
-
-    normalized = raw_path.replace('/', os.sep).replace('\\', os.sep)
-
-    if os.name == 'nt':  # Windows
-        if (len(normalized) > 1 and normalized[1] == ':') or normalized.startswith('\\\\'):
-            abs_path = normalized
-        else:
-            if normalized.startswith(os.sep):
-                rel_path = normalized.lstrip(os.sep)
-            else:
-                rel_path = normalized
-            abs_path = os.path.join(BASE_DIR, rel_path)
-    else:  # Unix-подобные (Linux, macOS)
-        if normalized.startswith('/'):
-            abs_path = normalized
-        else:
-            abs_path = os.path.join(BASE_DIR, normalized)
-
-    abs_path = os.path.abspath(abs_path)
-    if not os.path.isdir(abs_path):
-        return None
-    return abs_path
-
-def process_one_image(args):
-    dataset_path, filename, progress = args
-    img_path = os.path.join(dataset_path, filename)
-    try:
-        from database import get_image_quality, save_image_quality
-        from image_analyzer import ImageAnalyzer
-        from utils import get_file_hash
-
-        saved = get_image_quality(dataset_path, filename)
-        current_hash = get_file_hash(img_path)
-        if saved and saved.get('file_hash') == current_hash:
-            result = filename, 'skipped'
-        else:
-            analyzer = ImageAnalyzer()
-            metrics = analyzer.analyze_image(img_path)
-            if metrics:
-                save_image_quality(dataset_path, filename, metrics)
-            result = filename, 'analyzed'
-
-        progress['processed'] = progress.get('processed', 0) + 1
-        progress['current_file'] = filename
-
-        return result
-    except Exception as e:
-        import logging
-        logging.error(f"Ошибка анализа {filename}: {e}")
-        progress['processed'] = progress.get('processed', 0) + 1
-        return filename, 'error'
-
-def safe_join(working_dir, *paths):
-    full = os.path.realpath(os.path.join(working_dir, *paths))
-    if not full.startswith(os.path.realpath(working_dir)):
-        raise ValueError("Path traversal attempt")
-    return full
-
-def version_key(v):
-    m = re.match(r'v(\d+)_(\d+)', v)
-    if m:
-        return (int(m.group(1)), int(m.group(2)))
-    return (0, 0)
-
-def natural_key(text):
-    return [int(part) if part.isdigit() else part.lower() for part in re.split(r'(\d+)', text)]
-
-def perform_backup(dataset_path):
-    global backup_status
-    images = get_image_files(dataset_path)
-    total = len(images)
-    with backup_lock:
-        backup_status['running'] = True
-        backup_status['total'] = total
-        backup_status['processed'] = 0
-        backup_status['current_file'] = ''
-        backup_status['error'] = None
-
-    backup_dir = os.path.join(dataset_path, 'backup')
-    os.makedirs(backup_dir, exist_ok=True)
-
-    try:
-        for idx, img in enumerate(images):
-            with backup_lock:
-                if not backup_status['running']:
-                    break
-                backup_status['current_file'] = img
-
-            src_img = os.path.join(dataset_path, img)
-            dst_img = os.path.join(backup_dir, img)
-            shutil.copy2(src_img, dst_img)
-
-            txt_path = get_caption_path(src_img)
-            if os.path.exists(txt_path):
-                dst_txt = os.path.join(backup_dir, os.path.basename(txt_path))
-                shutil.copy2(txt_path, dst_txt)
-
-            with backup_lock:
-                backup_status['processed'] = idx + 1
-    except Exception as e:
-        with backup_lock:
-            backup_status['error'] = str(e)
-            backup_status['running'] = False
-            backup_status['current_file'] = ''
-        app.logger.error(f"Backup failed: {e}")
-        return
-
-    with backup_lock:
-        backup_status['running'] = False
-        backup_status['current_file'] = ''
-
-def perform_analysis(dataset_path):
-    global analyzer_status, analyzer_progress, analyzer_progress_lock
-    images = get_image_files(dataset_path)
-    total = len(images)
-    with analyzer_lock:
-        if analyzer_status['running']:
-            return
-        analyzer_status['running'] = True
-
-    manager = Manager()
-    progress = manager.dict({
-        'total': total,
-        'processed': 0,
-        'current_file': ''
-    })
-    with analyzer_progress_lock:
-        analyzer_progress = progress
-
-    args_list = [(dataset_path, f, progress) for f in images]
-    num_workers = min(multiprocessing.cpu_count(), 8)
-
-    with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
-        future_to_file = {executor.submit(process_one_image, args): args[1] for args in args_list}
-        for future in concurrent.futures.as_completed(future_to_file):
-            pass
-
-    try:
-        from database import update_duplicate_groups, update_similar_pairs
-        update_duplicate_groups(dataset_path)
-        update_similar_pairs(dataset_path)
-    except Exception as e:
-        app.logger.error(f"Ошибка обновления групп: {e}")
-
-    with analyzer_lock:
-        analyzer_status['running'] = False
-    with analyzer_progress_lock:
-        analyzer_progress = None
-
-    app.logger.info("Анализ завершён")
-
-
-@app.route('/api/analyze/start', methods=['POST'])
-def analyze_start():
-    if not current_dataset_path:
-        return jsonify({'error': 'Датасет не загружен'}), 400
-    with analyzer_lock:
-        if analyzer_status['running']:
-            return jsonify({'error': 'Анализ уже выполняется'}), 400
-    thread = threading.Thread(target=perform_analysis, args=(current_dataset_path,))
-    thread.daemon = True
-    thread.start()
-    return jsonify({'success': True})
-
-
-@app.route('/api/analyze/status', methods=['GET'])
-def analyze_status():
-    with analyzer_lock:
-        running = analyzer_status['running']
-    with analyzer_progress_lock:
-        if analyzer_progress is not None:
-            progress = dict(analyzer_progress)
-        else:
-            progress = {'total': 0, 'processed': 0, 'current_file': ''}
-    return jsonify({
-        'running': running,
-        'total': progress['total'],
-        'processed': progress['processed'],
-        'current_file': progress['current_file']
-    })
-
-@app.route('/api/analyze/stop', methods=['POST'])
-def analyze_stop():
-    with analyzer_lock:
-        if not analyzer_status['running']:
-            return jsonify({'error': 'Анализ не выполняется'}), 400
-        analyzer_status['running'] = False
-    return jsonify({'success': True, 'warning': 'Процессы остановки не поддерживаются, но статус сброшен'})
-
-@app.route('/api/duplicates', methods=['GET'])
-def get_duplicates():
-    if not current_dataset_path:
-        return jsonify({'error': 'Датасет не загружен'}), 400
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute('''
-            SELECT file_hash, files FROM duplicate_groups
-            WHERE file_hash IN (SELECT file_hash FROM image_quality WHERE dataset_path=?)
-        ''', (current_dataset_path,))
-        rows = c.fetchall()
-        groups = [{'hash': row[0], 'files': json.loads(row[1])} for row in rows]
-    return jsonify(groups)
-
-
-@app.route('/api/similar/<filename>', methods=['GET'])
-def get_similar(filename):
-    if not current_dataset_path:
-        return jsonify({'error': 'Датасет не загружен'}), 400
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute('''
-            SELECT filename2, similarity FROM similar_pairs
-            WHERE dataset_path=? AND filename1=?
-            UNION
-            SELECT filename1, similarity FROM similar_pairs
-            WHERE dataset_path=? AND filename2=?
-        ''', (current_dataset_path, filename, current_dataset_path, filename))
-        rows = c.fetchall()
-        similar = [{'filename': row[0], 'similarity': row[1]} for row in rows]
-    return jsonify(similar)
-
-@app.route('/api/backup/start', methods=['POST'])
-def backup_start():
-    if not current_dataset_path:
-        return jsonify({'error': 'Датасет не загружен'}), 400
-    with backup_lock:
-        if backup_status['running']:
-            return jsonify({'error': 'Бэкап уже выполняется'}), 400
-    thread = threading.Thread(target=perform_backup, args=(current_dataset_path,))
-    thread.daemon = True
-    thread.start()
-    return jsonify({'success': True})
-
-@app.route('/api/backup/status', methods=['GET'])
-def backup_status_api():
-    with backup_lock:
-        return jsonify(backup_status)
-
-@app.route('/api/backup/stop', methods=['POST'])
-def backup_stop():
-    with backup_lock:
-        backup_status['running'] = False
-    return jsonify({'success': True})
-
-def format_tags(tags):
-    return ', '.join(tags)
-
-def get_all_tags(dataset_path):
-    if not dataset_path or not os.path.isdir(dataset_path):
-        return Counter()
-    image_files = get_image_files(dataset_path)
-    all_tags = []
-    for img in image_files:
-        txt_path = get_caption_path(os.path.join(dataset_path, img))
-        caption = read_caption(txt_path)
-        tags = parse_tags(caption)
-        all_tags.extend(tags)
-    return Counter(all_tags)
-
-def get_image_dimensions(img_path):
-    with Image.open(img_path) as img:
-        return img.size
-
-def get_aspect_ratio_label(width, height):
-    ratio = width / height
-    targets = {
-        '1:1': 1.0,
-        '4:3': 4/3,
-        '3:4': 3/4,
-        '16:9': 16/9,
-        '9:16': 9/16,
-        '2:3': 2/3,
-        '3:2': 3/2,
-        '21:9': 21/9,
-        '9:21': 9/21,
-    }
-    best = min(targets.items(), key=lambda item: abs(ratio - item[1]))
-    return best[0]
-
-def is_multiple_of(image_size, base=32):
-    w, h = image_size
-    return (w % base == 0) and (h % base == 0)
-
-def analyze_ratings_background(dataset_path):
-    images = get_image_files(dataset_path)
-    total = len(images)
-    logger = app.logger
-
-    with rating_lock:
-        rating_status['running'] = True
-        rating_status['total'] = total
-        rating_status['processed'] = 0
-        rating_status['current_file'] = ''
-        rating_status['dataset_path'] = dataset_path
-
-    logger.info(f"Запуск фонового анализа рейтингов для {total} изображений")
-
-    for idx, img in enumerate(images):
-        with rating_lock:
-            if rating_status.get('dataset_path') != dataset_path:
-                logger.info("Анализ рейтингов остановлен из-за смены датасета")
-                break
-            rating_status['current_file'] = img
-
-        img_path = os.path.join(dataset_path, img)
-
-        try:
-            current_hash = get_file_hash(img_path)
-        except Exception as e:
-            logger.error(f"Ошибка вычисления хэша для {img}: {e}")
-            current_hash = None
-
-        saved_rating, saved_hash = get_image_rating_and_hash(dataset_path, img)
-        if saved_hash and saved_hash == current_hash:
-            with rating_lock:
-                rating_status['processed'] = idx + 1
-            continue
-
-        try:
-            rating = tagger.get_rating(img_path, RATING_MODEL)
-            save_image_rating(dataset_path, img, rating, current_hash)
-        except Exception as e:
-            logger.error(f"Ошибка при анализе рейтинга для {img}: {e}")
-            save_image_rating(dataset_path, img, 'general', current_hash)
-
-        with rating_lock:
-            rating_status['processed'] = idx + 1
-
-        if idx % 10 == 0:
-            logger.info(f"Прогресс рейтингов: {idx+1}/{total}")
-
-    with rating_lock:
-        rating_status['running'] = False
-        rating_status['current_file'] = ''
-
-    logger.info("Фоновый анализ рейтингов завершён")
+# ------------------------------------------------------------
+# Маршруты для работы с датасетами
+# ------------------------------------------------------------
 
 @app.route('/')
 def index():
     client_ip = request.remote_addr
     server_ips = get_server_ips()
-
     show_path_input = client_ip in server_ips
     return render_template('index.html', show_path_input=show_path_input)
 
 @app.route('/api/load-dataset', methods=['POST'])
 def load_dataset():
-    global current_dataset_path
     data = request.get_json()
     path = data.get('path', '').strip()
     if not os.path.isdir(path):
         return jsonify({'error': 'Папка не существует'}), 400
 
-    with rating_lock:
-        rating_status['dataset_path'] = None
-    with analyzer_lock:
-        analyzer_status['dataset_path'] = None
-
-    current_dataset_path = path
+    context.set_dataset_path(path)
     images = get_image_files(path)
 
-    thread_rating = threading.Thread(target=analyze_ratings_background, args=(path,))
-    thread_rating.daemon = True
-    thread_rating.start()
+    file_hashes = {}
+    for img in images:
+        img_path = os.path.join(path, img)
+        try:
+            file_hashes[img] = get_file_hash(img_path)
+        except Exception as e:
+            app.logger.error(f"Ошибка вычисления хэша для {img}: {e}")
+            file_hashes[img] = None
 
-    thread_quality = threading.Thread(target=perform_analysis, args=(path,))
-    thread_quality.daemon = True
-    thread_quality.start()
+    threading.Thread(target=context.rating.start, args=(path, file_hashes), daemon=True).start()
+    threading.Thread(target=context.analysis.start, args=(path, file_hashes), daemon=True).start()
 
-    return jsonify({
-        'count': len(images),
-        'images': images[:20]
-    })
-
-@app.route('/api/image-quality/<path:filename>', methods=['GET'])
-def get_image_quality_api(filename):
-    if not current_dataset_path:
-        return jsonify({'error': 'Датасет не загружен'}), 400
-    quality = get_image_quality(current_dataset_path, filename)
-    if quality:
-        return jsonify({
-            'width': quality['width'],
-            'height': quality['height'],
-            'aspect_ratio': quality['aspect_ratio'],
-            'multiple_32': bool(quality['multiple_32']),
-            'multiple_64': bool(quality['multiple_64']),
-            'overall_quality': quality['overall_quality'],
-            'sharpness': quality['sharpness'],
-            'jpeg_artifacts': quality['jpeg_artifacts'],
-            'noise_level': quality['noise_level'],
-            'resolution_score': quality['resolution_score']
-        })
-    else:
-        return jsonify({})
+    return jsonify({'count': len(images), 'images': images[:20]})
 
 @app.route('/api/get-tags', methods=['GET'])
 def get_tags():
-    if not current_dataset_path:
+    if not context.current_dataset_path:
         return jsonify({'error': 'Датасет не загружен'}), 400
-    tag_counter = get_all_tags(current_dataset_path)
-    tags = [{'tag': tag, 'count': count} for tag, count in tag_counter.most_common()]
-    return jsonify(tags)
-
-@app.route('/api/get-images', methods=['POST'])
-def get_images():
-    if not current_dataset_path:
-        return jsonify({'error': 'Датасет не загружен'}), 400
-    data = request.get_json()
-    selected_tags = data.get('tags', [])
-    image_files = get_image_files(current_dataset_path)
-
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute(
-            'SELECT DISTINCT filename1 FROM similar_pairs WHERE dataset_path=? UNION SELECT DISTINCT filename2 FROM similar_pairs WHERE dataset_path=?',
-            (current_dataset_path, current_dataset_path))
-        dup_files = set(row[0] for row in c.fetchall())
-
-    result = []
-    for img in image_files:
-        txt_path = get_caption_path(os.path.join(current_dataset_path, img))
-        caption = read_caption(txt_path)
-        tags = set(parse_tags(caption))
-        if selected_tags:
-            if not all(tag in tags for tag in selected_tags):
-                continue
-        img_path_full = os.path.join(current_dataset_path, img)
-        try:
-            w, h = get_image_dimensions(img_path_full)
-            mtime = os.path.getmtime(img_path_full)
-        except:
-            w, h = 0, 0
-            mtime = 0
-        rating = get_image_rating(current_dataset_path, img) or 'general'
-        result.append({
-            'filename': img,
-            'tag_count': len(tags),
-            'width': w,
-            'height': h,
-            'rating': rating,
-            'mtime': mtime,
-            'has_duplicate': img in dup_files
-        })
-    return jsonify(result)
-
-@app.route('/api/reset-ratings', methods=['POST'])
-def reset_ratings():
-    try:
-        clear_all_analysis_data()
-        return jsonify({'success': True})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    from collections import Counter
+    tag_counter = Counter()
+    for img in get_image_files(context.current_dataset_path):
+        caption = read_caption(get_caption_path(os.path.join(context.current_dataset_path, img)))
+        tag_counter.update(parse_tags(caption))
+    return jsonify([{'tag': t, 'count': c} for t, c in tag_counter.most_common()])
 
 @app.route('/api/datasets', methods=['GET'])
 def list_datasets():
@@ -605,22 +87,19 @@ def list_datasets():
                 continue
             image_count = 0
             cover = None
-            for root, dirs, files in os.walk(dataset_path):
+            for root, _, files in os.walk(dataset_path):
                 for f in files:
                     if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
                         image_count += 1
                         if cover is None:
                             cover = os.path.relpath(os.path.join(root, f), dataset_path)
-            versions = [d for d in os.listdir(dataset_path)
-                        if os.path.isdir(os.path.join(dataset_path, d)) and re.match(r'v\d+_\d+', d)]
-            versions.sort(key=version_key)
-            last_version = versions[-1] if versions else None
-
+            versions = [d for d in os.listdir(dataset_path) if os.path.isdir(os.path.join(dataset_path, d)) and re.match(r'v\d+_\d+', d)]
+            versions.sort(key=lambda v: tuple(map(int, re.match(r'v(\d+)_(\d+)', v).groups())))
             datasets.append({
                 'name': name,
                 'image_count': image_count,
                 'cover': cover,
-                'last_version': last_version
+                'last_version': versions[-1] if versions else None
             })
         return jsonify(datasets)
     except Exception as e:
@@ -641,32 +120,22 @@ def create_dataset():
     if os.path.exists(dataset_path):
         return jsonify({'error': 'Датасет с таким именем уже существует'}), 400
     os.mkdir(dataset_path)
-
-    version_path = os.path.join(dataset_path, 'v0_1')
-    os.mkdir(version_path)
+    os.mkdir(os.path.join(dataset_path, 'v0_1'))
 
     cover_file = request.files.get('cover')
     cover_filename = None
-    if cover_file and cover_file.filename:
-        if cover_file.filename.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
-            cover_filename = secure_filename(cover_file.filename)
-            cover_path = os.path.join(dataset_path, cover_filename)
-            cover_file.save(cover_path)
+    if cover_file and cover_file.filename and cover_file.filename.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+        cover_filename = secure_filename(cover_file.filename)
+        cover_file.save(os.path.join(dataset_path, cover_filename))
 
     metadata = {
         'name': name,
         'created': datetime.now().isoformat(),
-        'versions': {
-            'v0_1': {
-                'created': datetime.now().isoformat(),
-                'flags': []
-            }
-        },
+        'versions': {'v0_1': {'created': datetime.now().isoformat(), 'flags': []}},
         'cover': cover_filename
     }
     with open(os.path.join(dataset_path, 'metadata.json'), 'w', encoding='utf-8') as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
-
     return jsonify({'success': True, 'name': safe_name})
 
 @app.route('/api/datasets/<path:dataset_name>/browse', methods=['GET'])
@@ -680,147 +149,69 @@ def browse_dataset(dataset_name):
         current_path = safe_join(base_path, subpath) if subpath else base_path
         if not os.path.isdir(current_path):
             return jsonify({'error': 'Это не папка'}), 400
-
-        dirs = []
-        images = []
+        dirs, images = [], []
         for entry in os.listdir(current_path):
             full = os.path.join(current_path, entry)
             if os.path.isdir(full):
                 dirs.append(entry)
-            else:
-                ext = os.path.splitext(entry)[1].lower()
-                if ext in ('.jpg', '.jpeg', '.png', '.webp'):
-                    txt_path = os.path.splitext(full)[0] + '.txt'
-                    has_caption = os.path.exists(txt_path)
-                    images.append({
-                        'name': entry,
-                        'type': 'image',
-                        'has_caption': has_caption,
-                        'size': os.path.getsize(full),
-                        'mtime': os.path.getmtime(full)
-                    })
+            elif entry.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                txt_path = os.path.splitext(full)[0] + '.txt'
+                images.append({
+                    'name': entry, 'type': 'image', 'has_caption': os.path.exists(txt_path),
+                    'size': os.path.getsize(full), 'mtime': os.path.getmtime(full)
+                })
         dirs.sort(key=natural_key)
         images.sort(key=lambda x: natural_key(x['name']))
         items = [{'name': d, 'type': 'directory'} for d in dirs] + images
         return jsonify({'path': subpath, 'items': items})
     except ValueError as e:
         return jsonify({'error': str(e)}), 403
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/thumbnail/<path:filename>')
-def serve_thumbnail(filename):
-    if not current_dataset_path:
-        return 'Dataset not loaded', 404
-    safe_path = os.path.join(current_dataset_path, filename)
-    if not os.path.realpath(safe_path).startswith(os.path.realpath(current_dataset_path)):
-        return 'Access denied', 403
-    if not os.path.isfile(safe_path):
-        return 'File not found', 404
-
-    from PIL import Image
-    import io
-
-    img = Image.open(safe_path)
-    img.thumbnail((450, 450), Image.Resampling.LANCZOS)
-
-    img_io = io.BytesIO()
-    if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
-        img.save(img_io, format='PNG')
-        mimetype = 'image/png'
-    else:
-        img.save(img_io, format='JPEG', quality=85, optimize=True)
-        mimetype = 'image/jpeg'
-
-    img_io.seek(0)
-    response = send_file(img_io, mimetype=mimetype)
-    response.headers['Cache-Control'] = 'public, max-age=604800, immutable'
-    return response
 
 @app.route('/api/datasets/<path:dataset_name>/rename', methods=['POST'])
 def rename_dataset_item(dataset_name):
     wd = get_working_directory()
     if not wd:
         return jsonify({'error': 'Рабочая директория не задана'}), 400
-
     data = request.get_json()
     old_name = data.get('old_name')
     new_name = data.get('new_name')
     current_path = data.get('current_path', '')
-
     if not old_name or not new_name:
         return jsonify({'error': 'Не указаны имена'}), 400
-
     try:
         base_path = safe_join(wd, dataset_name)
         parent = safe_join(base_path, current_path) if current_path else base_path
         old_full = os.path.join(parent, old_name)
         new_full = os.path.join(parent, new_name)
-
         if not os.path.exists(old_full):
             return jsonify({'error': 'Исходный файл не найден'}), 404
         if os.path.exists(new_full):
             return jsonify({'error': 'Файл с новым именем уже существует'}), 400
-
         is_dir = os.path.isdir(old_full)
-
         os.rename(old_full, new_full)
-
         if is_dir:
+            from database import rename_folder_prefix_in_db
             rename_folder_prefix_in_db(old_full, new_full)
-            return jsonify({
-                'success': True,
-                'old_path': old_full,
-                'new_path': new_full
-            })
-
-        dataset_path_file = parent
-        old_filename = old_name
-        new_filename = new_name
-
+            return jsonify({'success': True, 'old_path': old_full, 'new_path': new_full})
         if old_name.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
             old_txt = os.path.splitext(old_full)[0] + '.txt'
             new_txt = os.path.splitext(new_full)[0] + '.txt'
             if os.path.exists(old_txt):
                 os.rename(old_txt, new_txt)
-
-        file_hash = None
-        with sqlite3.connect(DB_PATH) as conn:
+        db = context.db
+        with sqlite3.connect(db.db_path) as conn:
             c = conn.cursor()
-            c.execute(
-                'SELECT file_hash FROM image_quality WHERE dataset_path = ? AND filename = ?',
-                (dataset_path_file, old_filename)
-            )
-            row = c.fetchone()
-            if row:
-                file_hash = row[0]
-
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute(
-                'UPDATE image_quality SET filename = ? WHERE dataset_path = ? AND filename = ?',
-                (new_filename, dataset_path_file, old_filename)
-            )
-            c.execute(
-                'UPDATE image_ratings SET filename = ? WHERE dataset_path = ? AND filename = ?',
-                (new_filename, dataset_path_file, old_filename)
-            )
+            c.execute('UPDATE image_quality SET filename=? WHERE dataset_path=? AND filename=?',
+                      (new_name, parent, old_name))
+            c.execute('UPDATE image_ratings SET filename=? WHERE dataset_path=? AND filename=?',
+                      (new_name, parent, old_name))
             conn.commit()
-
-        rename_file_in_similar_pairs(dataset_path_file, old_filename, new_filename)
-
+        from database import rename_file_in_similar_pairs, rename_file_in_duplicate_groups
+        rename_file_in_similar_pairs(parent, old_name, new_name)
+        file_hash = db.get_image_quality(parent, old_name).get('file_hash') if db.get_image_quality(parent, old_name) else None
         if file_hash:
-            rename_file_in_duplicate_groups(dataset_path_file, old_filename, new_filename, file_hash)
-
-        return jsonify({
-            'success': True,
-            'old_path': old_full,
-            'new_path': new_full,
-            'affected_path': dataset_path_file
-        })
-
-    except ValueError as e:
-        return jsonify({'error': str(e)}), 403
+            rename_file_in_duplicate_groups(parent, old_name, new_name, file_hash)
+        return jsonify({'success': True, 'old_path': old_full, 'new_path': new_full})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -839,50 +230,34 @@ def delete_dataset_item(dataset_name):
         target = safe_join(base_path, current_path, name) if current_path else safe_join(base_path, name)
         if not os.path.exists(target):
             return jsonify({'error': 'Файл не найден'}), 404
-
         if os.path.isdir(target):
             shutil.rmtree(target)
             prefix = target + os.sep
-            with sqlite3.connect(DB_PATH) as conn:
+            db = context.db
+            with sqlite3.connect(db.db_path) as conn:
                 c = conn.cursor()
                 for table in ('image_quality', 'image_ratings'):
-                    c.execute(f'DELETE FROM {table} WHERE dataset_path = ? OR dataset_path LIKE ?',
-                              (target, prefix + '%'))
-                c.execute('DELETE FROM similar_pairs WHERE dataset_path = ? OR dataset_path LIKE ?',
-                          (target, prefix + '%'))
-                c.execute('DELETE FROM duplicate_groups WHERE dataset_path = ? OR dataset_path LIKE ?',
-                          (target, prefix + '%'))
+                    c.execute(f'DELETE FROM {table} WHERE dataset_path=? OR dataset_path LIKE ?', (target, prefix + '%'))
+                c.execute('DELETE FROM similar_pairs WHERE dataset_path=? OR dataset_path LIKE ?', (target, prefix + '%'))
+                c.execute('DELETE FROM duplicate_groups WHERE dataset_path=? OR dataset_path LIKE ?', (target, prefix + '%'))
                 conn.commit()
-            return jsonify({'success': True, 'old_path': target})
         else:
             os.remove(target)
             txt = os.path.splitext(target)[0] + '.txt'
             if os.path.exists(txt):
                 os.remove(txt)
-
-            dataset_path_file = os.path.dirname(target)
-            filename = name
-
-            with sqlite3.connect(DB_PATH) as conn:
+            db = context.db
+            with sqlite3.connect(db.db_path) as conn:
                 c = conn.cursor()
-                c.execute('DELETE FROM image_quality WHERE dataset_path = ? AND filename = ?',
-                          (dataset_path_file, filename))
-                c.execute('DELETE FROM image_ratings WHERE dataset_path = ? AND filename = ?',
-                          (dataset_path_file, filename))
-                c.execute('DELETE FROM similar_pairs WHERE dataset_path = ? AND (filename1 = ? OR filename2 = ?)',
-                          (dataset_path_file, filename, filename))
+                c.execute('DELETE FROM image_quality WHERE dataset_path=? AND filename=?', (os.path.dirname(target), name))
+                c.execute('DELETE FROM image_ratings WHERE dataset_path=? AND filename=?', (os.path.dirname(target), name))
+                c.execute('DELETE FROM similar_pairs WHERE dataset_path=? AND (filename1=? OR filename2=?)',
+                          (os.path.dirname(target), name, name))
                 conn.commit()
-
             from database import remove_from_duplicate_groups, remove_from_similar_pairs
-            remove_from_duplicate_groups(dataset_path_file, filename)
-            remove_from_similar_pairs(dataset_path_file, filename)
-
-            affected_path = dataset_path_file
-
-            return jsonify({'success': True, 'old_path': target, 'affected_path': dataset_path_file})
-
-    except ValueError as e:
-        return jsonify({'error': str(e)}), 403
+            remove_from_duplicate_groups(os.path.dirname(target), name)
+            remove_from_similar_pairs(os.path.dirname(target), name)
+        return jsonify({'success': True, 'old_path': target})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -897,44 +272,15 @@ def delete_dataset(name):
     try:
         shutil.rmtree(dataset_path)
         prefix = dataset_path + os.sep
-        with sqlite3.connect(DB_PATH) as conn:
+        db = context.db
+        with sqlite3.connect(db.db_path) as conn:
             c = conn.cursor()
             for table in ('image_quality', 'image_ratings', 'similar_pairs', 'duplicate_groups'):
-                c.execute(f'DELETE FROM {table} WHERE dataset_path = ? OR dataset_path LIKE ?',
-                          (dataset_path, prefix + '%'))
+                c.execute(f'DELETE FROM {table} WHERE dataset_path=? OR dataset_path LIKE ?', (dataset_path, prefix + '%'))
             conn.commit()
-        return jsonify({'success': True, 'old_path': dataset_path})
+        return jsonify({'success': True})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-
-@app.route('/api/flags', methods=['GET'])
-def get_flags():
-    return jsonify(get_all_flags())
-
-@app.route('/api/flags', methods=['POST'])
-def create_flag():
-    data = request.get_json()
-    name = data.get('name')
-    color = data.get('color', '#3b82f6')
-    if not name:
-        return jsonify({'error': 'Имя флага обязательно'}), 400
-    add_flag(name, color)
-    return jsonify({'success': True})
-
-@app.route('/api/flags/<name>', methods=['PUT'])
-def update_flag(name):
-    data = request.get_json()
-    new_name = data.get('name')
-    new_color = data.get('color')
-    if not new_name:
-        return jsonify({'error': 'Новое имя обязательно'}), 400
-    rename_flag(name, new_name, new_color)
-    return jsonify({'success': True})
-
-@app.route('/api/flags/<name>', methods=['DELETE'])
-def remove_flag(name):
-    delete_flag(name)
-    return jsonify({'success': True})
 
 @app.route('/api/datasets/<path:dataset_name>/thumbnail/<path:filepath>')
 def dataset_thumbnail(dataset_name, filepath):
@@ -943,15 +289,12 @@ def dataset_thumbnail(dataset_name, filepath):
         return 'Рабочая директория не задана', 400
     try:
         full_path = safe_join(wd, dataset_name, filepath)
-        if not os.path.isfile(full_path) or not full_path.lower().endswith(('.jpg','.jpeg','.png','.webp')):
+        if not os.path.isfile(full_path) or not full_path.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
             return 'Not an image', 404
-
         from PIL import Image
         import io
-
         img = Image.open(full_path)
         img.thumbnail((450, 450), Image.Resampling.LANCZOS)
-
         img_io = io.BytesIO()
         if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
             img.save(img_io, format='PNG')
@@ -959,9 +302,7 @@ def dataset_thumbnail(dataset_name, filepath):
         else:
             img.save(img_io, format='JPEG', quality=85, optimize=True)
             mimetype = 'image/jpeg'
-
         img_io.seek(0)
-
         response = send_file(img_io, mimetype=mimetype)
         response.headers['Cache-Control'] = 'public, max-age=604800, immutable'
         return response
@@ -975,63 +316,13 @@ def dataset_image(dataset_name, filepath):
         return 'Рабочая директория не задана', 400
     try:
         full_path = safe_join(wd, dataset_name, filepath)
-        if not os.path.isfile(full_path) or not full_path.lower().endswith(('.jpg','.jpeg','.png','.webp')):
+        if not os.path.isfile(full_path) or not full_path.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
             return 'Not an image', 404
         response = send_file(full_path)
         response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
-        response.headers['Pragma'] = 'no-cache'
-        response.headers['Expires'] = '0'
         return response
     except Exception as e:
         return str(e), 500
-
-@app.route('/api/version-stats', methods=['GET'])
-def version_stats():
-    dataset_name = request.args.get('dataset')
-    versions = request.args.getlist('versions')
-    if not dataset_name or not versions:
-        return jsonify({'error': 'Не указан датасет или версии'}), 400
-
-    wd = get_working_directory()
-    if not wd:
-        return jsonify({'error': 'Рабочая директория не задана'}), 400
-
-    dataset_path = os.path.join(wd, dataset_name)
-    if not os.path.isdir(dataset_path):
-        return jsonify({'error': 'Датасет не найден'}), 404
-
-    stats = {}
-    for version in versions:
-        version_full_path = os.path.join(dataset_path, version)
-        if not os.path.isdir(version_full_path):
-            stats[version] = {'error': 'Версия не найдена'}
-        else:
-            stats[version] = get_version_stats(version_full_path)
-    return jsonify(stats)
-
-@app.route('/api/version-quality-check', methods=['GET'])
-def version_quality_check():
-    dataset_name = request.args.get('dataset')
-    version = request.args.get('version')
-    if not dataset_name or not version:
-        return jsonify({'has_data': False})
-
-    wd = get_working_directory()
-    if not wd:
-        return jsonify({'has_data': False})
-
-    dataset_path = os.path.join(wd, dataset_name)
-    version_full_path = os.path.join(dataset_path, version)
-
-    if not os.path.isdir(version_full_path):
-        return jsonify({'has_data': False})
-
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute('SELECT COUNT(*) FROM image_quality WHERE dataset_path=?', (version_full_path,))
-        count = c.fetchone()[0]
-
-    return jsonify({'has_data': count > 0})
 
 @app.route('/api/datasets/<name>/fullpath', methods=['GET'])
 def dataset_fullpath(name):
@@ -1061,24 +352,90 @@ def upload_to_dataset(dataset_name):
             return jsonify({'error': 'Целевая папка не существует'}), 400
 
         uploaded_files = request.files.getlist('files')
+        groups = {}
         for file in uploaded_files:
-            filename = secure_filename(file.filename)
-            if not filename:
+            original_filename = secure_filename(file.filename)
+            if not original_filename:
                 continue
-            save_path = os.path.join(dest_dir, filename)
-            file.save(save_path)
-            if filename.lower().endswith('.txt'):
-                base = os.path.splitext(filename)[0]
-                found = False
-                for ext in ('.jpg', '.jpeg', '.png', '.webp'):
-                    if os.path.exists(os.path.join(dest_dir, base + ext)):
-                        found = True
-                        break
-                if not found:
-                    os.remove(save_path)
+            base, ext = os.path.splitext(original_filename)
+            ext = ext.lower()
+            groups.setdefault(base, []).append((file, ext))
+
+        image_extensions = {'.jpg', '.jpeg', '.png', '.webp'}
+
+        def get_unique_basename(directory, base_name, extensions):
+            def exists(basename):
+                for ext in extensions:
+                    if os.path.exists(os.path.join(directory, f"{basename}{ext}")):
+                        return True
+                return False
+            if not exists(base_name):
+                return base_name
+            counter = 1
+            while True:
+                new_base = f"{base_name}_{counter}"
+                if not exists(new_base):
+                    return new_base
+                counter += 1
+
+        for base, files in groups.items():
+            extensions = list(set(ext for _, ext in files))
+            new_base = get_unique_basename(dest_dir, base, extensions)
+            has_image = any(ext in image_extensions for _, ext in files)
+            for file, ext in files:
+                new_filename = new_base + ext
+                file.save(os.path.join(dest_dir, new_filename))
+            if not has_image:
+                for _, ext in files:
+                    if ext == '.txt':
+                        txt_path = os.path.join(dest_dir, new_base + ext)
+                        if os.path.exists(txt_path):
+                            os.remove(txt_path)
         return jsonify({'success': True})
-    except ValueError as e:
-        return jsonify({'error': str(e)}), 403
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/datasets/<path:dataset_name>/upload-url', methods=['POST'])
+def upload_image_from_url(dataset_name):
+    wd = get_working_directory()
+    if not wd:
+        return jsonify({'error': 'Рабочая директория не задана'}), 400
+    data = request.get_json()
+    url = data.get('url')
+    target_path = data.get('path', '')
+    if not url:
+        return jsonify({'error': 'URL не указан'}), 400
+    try:
+        base_path = safe_join(wd, dataset_name)
+        dest_dir = safe_join(base_path, target_path) if target_path else base_path
+        if not os.path.isdir(dest_dir):
+            return jsonify({'error': 'Целевая папка не существует'}), 400
+        import requests
+        import hashlib
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        resp = requests.get(url, headers=headers, timeout=30)
+        if resp.status_code != 200:
+            return jsonify({'error': f'Не удалось загрузить: HTTP {resp.status_code}'}), 400
+        content_type = resp.headers.get('Content-Type', '')
+        if not content_type.startswith('image/'):
+            return jsonify({'error': 'URL не указывает на изображение'}), 400
+        ext_map = {'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'image/gif': '.gif'}
+        ext = ext_map.get(content_type, '.jpg')
+        url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
+        base_name = f"web_{url_hash}"
+        def get_unique_filename(directory, filename):
+            base, ext = os.path.splitext(filename)
+            counter = 1
+            new_name = filename
+            while os.path.exists(os.path.join(directory, new_name)):
+                new_name = f"{base}_{counter}{ext}"
+                counter += 1
+            return new_name
+        final_filename = get_unique_filename(dest_dir, base_name + ext)
+        final_path = os.path.join(dest_dir, final_filename)
+        with open(final_path, 'wb') as f:
+            f.write(resp.content)
+        return jsonify({'success': True, 'filename': final_filename})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -1096,10 +453,8 @@ def create_dataset_version(dataset_name):
         base_path = safe_join(wd, dataset_name)
         version_name = f"v{major}_{minor}"
         version_path = os.path.join(base_path, version_name)
-
         if os.path.exists(version_path):
             return jsonify({'error': 'Такая версия уже существует'}), 400
-
         if base_version:
             base_version_path = os.path.join(base_path, base_version)
             if not os.path.isdir(base_version_path):
@@ -1107,91 +462,21 @@ def create_dataset_version(dataset_name):
             shutil.copytree(base_version_path, version_path)
         else:
             os.mkdir(version_path)
-
         meta_path = os.path.join(base_path, 'metadata.json')
         if os.path.exists(meta_path):
             with open(meta_path, 'r', encoding='utf-8') as f:
                 metadata = json.load(f)
         else:
             metadata = {}
-        if 'versions' not in metadata:
-            metadata['versions'] = {}
-        metadata['versions'][version_name] = {
+        metadata.setdefault('versions', {})[version_name] = {
             'created': datetime.now().isoformat(),
             'flags': flags
         }
         with open(meta_path, 'w', encoding='utf-8') as f:
             json.dump(metadata, f, ensure_ascii=False, indent=2)
-
         return jsonify({'success': True, 'version': version_name})
-    except ValueError as e:
-        return jsonify({'error': str(e)}), 403
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-
-def update_run_bat(host, port):
-    if not host:
-        host = '127.0.0.1'
-    if not port:
-        port = 5000
-    else:
-        port = int(port)
-
-    browser_host = '127.0.0.1' if host == '0.0.0.0' else host
-    url = f"http://{browser_host}:{port}"
-
-    bat_path = os.path.join(BASE_DIR, 'run.bat')
-    template_lines = [
-        '@echo off\n',
-        'chcp 65001 >nul\n',
-        'echo Launching TagForge...\n',
-        'echo.\n',
-        'call "%~dp0venv\\Scripts\\activate.bat"\n',
-        'if errorlevel 1 (\n',
-        '    echo [ERROR] The environment could not be activated.\n',
-        '    pause\n',
-        '    exit /b 1\n',
-        ')\n',
-        'echo Opening browser...\n',
-        f'start /b "" cmd /c "start {url}"\n',
-        'python app.py\n',
-        'if errorlevel 1 (\n',
-        '    echo.\n',
-        '    echo [ERROR] The program has terminated with an error.\n',
-        '    pause\n',
-        ')\n',
-        'deactivate\n'
-    ]
-
-    try:
-        if os.path.exists(bat_path):
-            with open(bat_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-        else:
-            lines = template_lines
-
-        replaced = False
-        for i, line in enumerate(lines):
-            if 'start /b "" cmd /c "start' in line:
-                lines[i] = f'start /b "" cmd /c "start {url}"\n'
-                replaced = True
-                break
-        if not replaced:
-            for i, line in enumerate(lines):
-                if line.strip().startswith('python app.py'):
-                    lines.insert(i, f'start /b "" cmd /c "start {url}"\n')
-                    replaced = True
-                    break
-            if not replaced:
-                lines.append(f'start /b "" cmd /c "start {url}"\n')
-
-        with open(bat_path, 'w', encoding='utf-8') as f:
-            f.writelines(lines)
-
-        app.logger.info(f"run.bat updated with URL: {url}")
-    except Exception as e:
-        app.logger.error(f"Failed to update run.bat: {e}")
-        raise
 
 @app.route('/api/datasets/<path:dataset_name>/versions', methods=['GET'])
 def dataset_versions(dataset_name):
@@ -1206,8 +491,7 @@ def dataset_versions(dataset_name):
                 metadata = json.load(f)
         else:
             metadata = {}
-        versions = metadata.get('versions', {})
-        return jsonify(versions)
+        return jsonify(metadata.get('versions', {}))
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -1225,22 +509,10 @@ def dataset_info(dataset_name):
         if os.path.exists(meta_path):
             with open(meta_path, 'r', encoding='utf-8') as f:
                 metadata = json.load(f)
-        versions = [d for d in os.listdir(base_path)
-                    if os.path.isdir(os.path.join(base_path, d)) and re.match(r'v\d+_\d+', d)]
-        versions.sort(key=version_key)
-        image_count = 0
-        for root, dirs, files in os.walk(base_path):
-            for f in files:
-                if f.lower().endswith(('.jpg','.jpeg','.png','.webp')):
-                    image_count += 1
-        return jsonify({
-            'name': dataset_name,
-            'metadata': metadata,
-            'versions': versions,
-            'image_count': image_count
-        })
-    except ValueError as e:
-        return jsonify({'error': str(e)}), 403
+        versions = [d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d)) and re.match(r'v\d+_\d+', d)]
+        versions.sort(key=lambda v: tuple(map(int, re.match(r'v(\d+)_(\d+)', v).groups())))
+        image_count = sum(1 for root, _, files in os.walk(base_path) for f in files if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')))
+        return jsonify({'name': dataset_name, 'metadata': metadata, 'versions': versions, 'image_count': image_count})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -1253,40 +525,30 @@ def rename_dataset(old_name):
     new_name = data.get('new_name')
     if not new_name:
         return jsonify({'error': 'Новое имя не указано'}), 400
-
     safe_new = secure_filename(new_name)
     if not safe_new:
         return jsonify({'error': 'Некорректное имя'}), 400
-
     old_path = os.path.join(wd, old_name)
     new_path = os.path.join(wd, safe_new)
-
     if not os.path.exists(old_path):
         return jsonify({'error': 'Датасет не найден'}), 404
     if os.path.exists(new_path):
         return jsonify({'error': 'Датасет с таким именем уже существует'}), 400
-
     try:
         os.rename(old_path, new_path)
         prefix = old_path + os.sep
-        with sqlite3.connect(DB_PATH) as conn:
+        db = context.db
+        with sqlite3.connect(db.db_path) as conn:
             c = conn.cursor()
             for table in ('image_quality', 'image_ratings', 'similar_pairs', 'duplicate_groups'):
-                c.execute(f'SELECT DISTINCT dataset_path FROM {table} WHERE dataset_path = ? OR dataset_path LIKE ?',
-                          (old_path, prefix + '%'))
-                rows = c.fetchall()
-                for (old_db_path,) in rows:
-                    if old_db_path == old_path:
-                        new_db_path = new_path
-                    else:
-                        new_db_path = new_path + old_db_path[len(old_path):]
-                    c.execute(f'UPDATE {table} SET dataset_path = ? WHERE dataset_path = ?',
-                              (new_db_path, old_db_path))
+                c.execute(f'SELECT DISTINCT dataset_path FROM {table} WHERE dataset_path = ? OR dataset_path LIKE ?', (old_path, prefix + '%'))
+                for (old_db_path,) in c.fetchall():
+                    new_db_path = new_path + old_db_path[len(old_path):]
+                    c.execute(f'UPDATE {table} SET dataset_path = ? WHERE dataset_path = ?', (new_db_path, old_db_path))
             conn.commit()
-        return jsonify({'success': True, 'new_name': safe_new, 'old_path': old_path, 'new_path': new_path})
+        return jsonify({'success': True, 'new_name': safe_new})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-
 
 @app.route('/api/datasets/<name>/cover', methods=['POST'])
 def upload_dataset_cover(name):
@@ -1296,36 +558,26 @@ def upload_dataset_cover(name):
     dataset_path = os.path.join(wd, name)
     if not os.path.isdir(dataset_path):
         return jsonify({'error': 'Датасет не найден'}), 404
-
     file = request.files.get('cover')
     if not file or not file.filename:
         return jsonify({'error': 'Файл не передан'}), 400
-
     if not file.filename.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
-        return jsonify({'error': 'Недопустимый формат изображения'}), 400
-
+        return jsonify({'error': 'Недопустимый формат'}), 400
     meta_path = os.path.join(dataset_path, 'metadata.json')
     if os.path.exists(meta_path):
         with open(meta_path, 'r', encoding='utf-8') as f:
             metadata = json.load(f)
         old_cover = metadata.get('cover')
-        if old_cover:
-            old_cover_path = os.path.join(dataset_path, old_cover)
-            if os.path.exists(old_cover_path):
-                os.remove(old_cover_path)
+        if old_cover and os.path.exists(os.path.join(dataset_path, old_cover)):
+            os.remove(os.path.join(dataset_path, old_cover))
     else:
         metadata = {}
-
     filename = secure_filename(file.filename)
-    save_path = os.path.join(dataset_path, filename)
-    file.save(save_path)
-
+    file.save(os.path.join(dataset_path, filename))
     metadata['cover'] = filename
     with open(meta_path, 'w', encoding='utf-8') as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
-
     return jsonify({'success': True, 'cover': filename})
-
 
 @app.route('/api/datasets/<name>/cover', methods=['DELETE'])
 def delete_dataset_cover(name):
@@ -1335,26 +587,16 @@ def delete_dataset_cover(name):
     dataset_path = os.path.join(wd, name)
     if not os.path.isdir(dataset_path):
         return jsonify({'error': 'Датасет не найден'}), 404
-
     meta_path = os.path.join(dataset_path, 'metadata.json')
-    if not os.path.exists(meta_path):
-        return jsonify({'success': True})
-
-    with open(meta_path, 'r', encoding='utf-8') as f:
-        metadata = json.load(f)
-
-    old_cover = metadata.get('cover')
-    if old_cover:
-        cover_path = os.path.join(dataset_path, old_cover)
-        if os.path.exists(cover_path):
-            os.remove(cover_path)
-
-    metadata.pop('cover', None)
-    with open(meta_path, 'w', encoding='utf-8') as f:
-        json.dump(metadata, f, ensure_ascii=False, indent=2)
-
+    if os.path.exists(meta_path):
+        with open(meta_path, 'r', encoding='utf-8') as f:
+            metadata = json.load(f)
+        old_cover = metadata.pop('cover', None)
+        if old_cover and os.path.exists(os.path.join(dataset_path, old_cover)):
+            os.remove(os.path.join(dataset_path, old_cover))
+        with open(meta_path, 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, ensure_ascii=False, indent=2)
     return jsonify({'success': True})
-
 
 @app.route('/api/datasets/<name>/version/<version>', methods=['DELETE'])
 def delete_dataset_version(name, version):
@@ -1363,518 +605,45 @@ def delete_dataset_version(name, version):
         return jsonify({'error': 'Рабочая директория не задана'}), 400
     dataset_path = os.path.join(wd, name)
     version_path = os.path.join(dataset_path, version)
-
     if not os.path.isdir(version_path):
         return jsonify({'error': 'Версия не найдена'}), 404
-
     if not re.match(r'v\d+_\d+', version):
         return jsonify({'error': 'Некорректное имя версии'}), 400
-
     try:
         shutil.rmtree(version_path)
-    except Exception as e:
-        return jsonify({'error': f'Не удалось удалить папку: {str(e)}'}), 500
-
-    prefix = version_path + os.sep
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        for table in ('image_quality', 'image_ratings'):
-            c.execute(f'DELETE FROM {table} WHERE dataset_path = ? OR dataset_path LIKE ?',
-                      (version_path, prefix + '%'))
-        c.execute('DELETE FROM similar_pairs WHERE dataset_path = ? OR dataset_path LIKE ?',
-                  (version_path, prefix + '%'))
-        c.execute('DELETE FROM duplicate_groups WHERE dataset_path = ? OR dataset_path LIKE ?',
-                  (version_path, prefix + '%'))
-        conn.commit()
-
-    meta_path = os.path.join(dataset_path, 'metadata.json')
-    if os.path.exists(meta_path):
-        with open(meta_path, 'r', encoding='utf-8') as f:
-            metadata = json.load(f)
-        if 'versions' in metadata and version in metadata['versions']:
-            del metadata['versions'][version]
-            with open(meta_path, 'w', encoding='utf-8') as f:
-                json.dump(metadata, f, ensure_ascii=False, indent=2)
-
-    return jsonify({'success': True, 'old_path': version_path})
-
-@app.route('/api/vocabulary/<path:dataset_path>', methods=['GET'])
-def get_vocabulary(dataset_path):
-    if not os.path.isdir(dataset_path):
-        return jsonify({'error': 'Dataset path does not exist'}), 404
-    content_json = get_dataset_vocabulary(dataset_path)
-    if content_json:
-        return jsonify({'content': json.loads(content_json)})
-    else:
-        fallback = OrderedDict([
-            ("Trigger_words", ["example_trigger word", "anower_example"]),
-            ("Default outfit", ["example_outfit word", "anower_example"]),
-            ("Optional", ["example_optional word", "anower_example"])
-        ])
-        return jsonify({'content': fallback})
-
-@app.route('/api/vocabulary/<path:dataset_path>', methods=['POST'])
-def save_vocabulary(dataset_path):
-    if not os.path.isdir(dataset_path):
-        return jsonify({'error': 'Dataset path does not exist'}), 404
-    data = request.get_json()
-    content = data.get('content')
-    if content is None:
-        return jsonify({'error': 'Missing content'}), 400
-    save_dataset_vocabulary(dataset_path, json.dumps(content))
-    return jsonify({'success': True})
-
-@app.route('/api/image/<path:filename>')
-def serve_image(filename):
-    if not current_dataset_path:
-        return 'Dataset not loaded', 404
-    safe_path = os.path.join(current_dataset_path, filename)
-    if not os.path.realpath(safe_path).startswith(os.path.realpath(current_dataset_path)):
-        return 'Access denied', 403
-    if not os.path.isfile(safe_path):
-        return 'File not found', 404
-    response = send_file(safe_path)
-    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
-    response.headers['Pragma'] = 'no-cache'
-    response.headers['Expires'] = '0'
-    return response
-
-@app.route('/api/get-caption', methods=['POST'])
-def get_caption():
-    if not current_dataset_path:
-        return jsonify({'error': 'Датасет не загружен'}), 400
-    data = request.get_json()
-    filename = data.get('filename')
-    txt_path = get_caption_path(os.path.join(current_dataset_path, filename))
-    caption = read_caption(txt_path)
-    return jsonify({'caption': caption})
-
-@app.route('/api/update-caption', methods=['POST'])
-def update_caption():
-    if not current_dataset_path:
-        return jsonify({'error': 'Датасет не загружен'}), 400
-    data = request.get_json()
-    filename = data.get('filename')
-    caption = data.get('caption', '')
-    txt_path = get_caption_path(os.path.join(current_dataset_path, filename))
-    write_caption(txt_path, caption)
-    return jsonify({'success': True})
-
-@app.route('/api/bulk-rename', methods=['POST'])
-def bulk_rename():
-    if not current_dataset_path:
-        return jsonify({'error': 'Датасет не загружен'}), 400
-
-    images = get_image_files(current_dataset_path)
-    rename_map = []
-
-    for idx, img in enumerate(images, start=1):
-        base, ext = os.path.splitext(img)
-        new_img_name = f"{idx}{ext}"
-        old_img_path = os.path.join(current_dataset_path, img)
-        new_img_path = os.path.join(current_dataset_path, new_img_name)
-
-        os.rename(old_img_path, new_img_path)
-
-        old_txt_path = get_caption_path(old_img_path)
-        new_txt_path = get_caption_path(new_img_path)
-        if os.path.exists(old_txt_path):
-            os.rename(old_txt_path, new_txt_path)
-        else:
-            write_caption(new_txt_path, '')
-
-        rename_map.append((img, new_img_name))
-
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        for old_name, new_name in rename_map:
-            c.execute('''
-                UPDATE image_quality
-                SET filename = ?
-                WHERE dataset_path = ? AND filename = ?
-            ''', (new_name, current_dataset_path, old_name))
-
-            c.execute('''
-                UPDATE image_ratings
-                SET filename = ?
-                WHERE dataset_path = ? AND filename = ?
-            ''', (new_name, current_dataset_path, old_name))
-
-        c.execute('DELETE FROM duplicate_groups WHERE dataset_path = ?', (current_dataset_path,))
-        c.execute('DELETE FROM similar_pairs WHERE dataset_path = ?', (current_dataset_path,))
-        conn.commit()
-
-    update_duplicate_groups(current_dataset_path)
-    update_similar_pairs(current_dataset_path)
-
-    return jsonify({'success': True})
-
-@app.route('/api/bulk-delete-tags', methods=['POST'])
-def bulk_delete_tags():
-    if not current_dataset_path:
-        return jsonify({'error': 'Датасет не загружен'}), 400
-    data = request.get_json()
-    tags_to_delete = data.get('tags', [])
-    if not tags_to_delete:
-        return jsonify({'error': 'Нет тегов для удаления'}), 400
-    images = get_image_files(current_dataset_path)
-    for img in images:
-        txt_path = get_caption_path(os.path.join(current_dataset_path, img))
-        caption = read_caption(txt_path)
-        tags = parse_tags(caption)
-        new_tags = [t for t in tags if t not in tags_to_delete]
-        if len(new_tags) != len(tags):
-            write_caption(txt_path, format_tags(new_tags))
-    return jsonify({'success': True})
-
-@app.route('/api/bulk-add-tags', methods=['POST'])
-def bulk_add_tags():
-    if not current_dataset_path:
-        return jsonify({'error': 'Датасет не загружен'}), 400
-    data = request.get_json()
-    tags_to_add = data.get('tags', [])
-    position = data.get('position', 'end')
-    if not tags_to_add:
-        return jsonify({'error': 'Нет тегов для добавления'}), 400
-    images = get_image_files(current_dataset_path)
-    for img in images:
-        txt_path = get_caption_path(os.path.join(current_dataset_path, img))
-        caption = read_caption(txt_path)
-        tags = parse_tags(caption)
-        new_tags = tags[:]
-        for tag in tags_to_add:
-            if tag not in tags:
-                if position == 'start':
-                    new_tags.insert(0, tag)
-                else:
-                    new_tags.append(tag)
-        if new_tags != tags:
-            write_caption(txt_path, format_tags(new_tags))
-    return jsonify({'success': True})
-
-@app.route('/api/bulk-replace-tag', methods=['POST'])
-def bulk_replace_tag():
-    if not current_dataset_path:
-        return jsonify({'error': 'Датасет не загружен'}), 400
-    data = request.get_json()
-    old_tag = data.get('old_tag', '').strip()
-    new_tag = data.get('new_tag', '').strip()
-    if not old_tag or not new_tag:
-        return jsonify({'error': 'Укажите оба тега'}), 400
-    images = get_image_files(current_dataset_path)
-    for img in images:
-        txt_path = get_caption_path(os.path.join(current_dataset_path, img))
-        caption = read_caption(txt_path)
-        tags = parse_tags(caption)
-        new_tags = [new_tag if t == old_tag else t for t in tags]
-        if new_tags != tags:
-            write_caption(txt_path, format_tags(new_tags))
-    return jsonify({'success': True})
-
-@app.route('/api/get-analysis', methods=['GET'])
-def get_analysis():
-    if not current_dataset_path:
-        return jsonify({'error': 'Датасет не загружен'}), 400
-    images = get_image_files(current_dataset_path)
-    rating_counts = {'general': 0, 'sensitive': 0, 'questionable': 0, 'explicit': 0}
-    ratings_dict = get_all_ratings_for_dataset(current_dataset_path)
-    resolution_counter = Counter()
-    tag_counter = Counter()
-    aspect_counter = Counter()
-    good_for_training_count = 0
-    total_tags_count = 0
-
-    for img in images:
-        rating = ratings_dict.get(img, 'general')
-        if rating in rating_counts:
-            rating_counts[rating] += 1
-        else:
-            rating_counts['general'] += 1
-
-        txt_path = get_caption_path(os.path.join(current_dataset_path, img))
-        caption = read_caption(txt_path)
-        tags = parse_tags(caption)
-        tag_counter.update(tags)
-        total_tags_count += len(tags)
-
-        img_path_full = os.path.join(current_dataset_path, img)
-        try:
-            w, h = get_image_dimensions(img_path_full)
-            resolution_counter[f"{w}x{h}"] += 1
-            aspect = get_aspect_ratio_label(w, h)
-            aspect_counter[aspect] += 1
-            if (w % 32 == 0 and h % 32 == 0) or (w % 64 == 0 and h % 64 == 0):
-                good_for_training_count += 1
-        except:
-            pass
-
-    top_tags = [{'tag': tag, 'count': count} for tag, count in tag_counter.most_common(20)]
-    predominant_aspect = aspect_counter.most_common(1)[0][0] if aspect_counter else 'N/A'
-    total_images = len(images)
-    good_percent = round((good_for_training_count / total_images * 100), 1) if total_images else 0
-
-    return jsonify({
-        'ratings': rating_counts,
-        'resolutions': [{'resolution': res, 'count': cnt} for res, cnt in resolution_counter.items()],
-        'top_tags': top_tags,
-        'total_images': total_images,
-        'unique_tags': len(tag_counter),
-        'avg_tags_per_image': round(total_tags_count / total_images, 1) if total_images else 0,
-        'predominant_aspect': predominant_aspect,
-        'good_for_training_count': good_for_training_count,
-        'good_for_training_percent': good_percent
-    })
-
-@app.route('/api/image-rating/<path:filename>', methods=['GET'])
-def get_image_rating_api(filename):
-    if not current_dataset_path:
-        return jsonify({'error': 'Датасет не загружен'}), 400
-    rating = get_image_rating(current_dataset_path, filename)
-    if rating is None:
-        rating = 'general'
-    return jsonify({'rating': rating})
-
-@app.route('/api/rating-analysis/status', methods=['GET'])
-def rating_status_api():
-    with rating_lock:
-        status = rating_status.copy()
-        status.pop('dataset_path', None)
-        return jsonify(status)
-
-@app.route('/api/languages', methods=['GET'])
-def get_languages():
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute('SELECT DISTINCT lang FROM translations')
-        langs = [row[0] for row in c.fetchall()]
-    return jsonify(langs)
-
-@app.route('/api/translations/<lang>', methods=['GET'])
-def get_translations(lang):
-    return jsonify(get_all_translations(lang))
-
-@app.route('/api/settings', methods=['GET'])
-def get_settings():
-    lang = get_setting('language', 'ru')
-    color = get_setting('accent_color', '#3b82f6')
-    wd = get_setting('working_directory', '')
-    zoom_enabled = get_setting('zoom_enabled', 'true') == 'true'
-    zoom_factor = float(get_setting('zoom_factor', '2.0'))
-    server_host = get_setting('server_host', '')
-    server_port = get_setting('server_port', '')
-    return jsonify({
-        'language': lang,
-        'accent_color': color,
-        'working_directory': wd,
-        'zoom_enabled': zoom_enabled,
-        'zoom_factor': zoom_factor,
-        'server_host': server_host,
-        'server_port': server_port
-    })
-
-@app.route('/api/settings', methods=['POST'])
-def save_settings():
-    data = request.get_json()
-    lang = data.get('language')
-    color = data.get('accent_color')
-    wd = data.get('working_directory')
-    zoom_enabled = data.get('zoom_enabled')
-    zoom_factor = data.get('zoom_factor')
-    server_host = data.get('server_host')
-    server_port = data.get('server_port')
-
-    old_host = get_setting('server_host', '')
-    old_port = get_setting('server_port', '')
-
-    if lang:
-        set_setting('language', lang)
-    if color:
-        set_setting('accent_color', color)
-    if wd is not None:
-        set_setting('working_directory', wd)
-    if zoom_enabled is not None:
-        set_setting('zoom_enabled', 'true' if zoom_enabled else 'false')
-    if zoom_factor is not None:
-        set_setting('zoom_factor', str(zoom_factor))
-    if server_host is not None:
-        set_setting('server_host', server_host)
-    if server_port is not None:
-        set_setting('server_port', server_port)
-
-    host_changed = server_host is not None and server_host != old_host
-    port_changed = server_port is not None and server_port != old_port
-    if host_changed or port_changed:
-        new_host = server_host if server_host is not None else old_host
-        new_port = server_port if server_port is not None else old_port
-        try:
-            update_run_bat(new_host, new_port)
-        except Exception as e:
-            app.logger.error(f"Failed to update run.bat: {e}")
-            return jsonify({'success': True, 'warning': f'Настройки сохранены, но не удалось обновить run.bat: {e}'})
-
-    return jsonify({'success': True})
-
-@app.route('/api/delete-image', methods=['POST'])
-def delete_image():
-    if not current_dataset_path:
-        return jsonify({'error': 'Датасет не загружен'}), 400
-    data = request.get_json()
-    filename = data.get('filename')
-    if not filename:
-        return jsonify({'error': 'Filename required'}), 400
-
-    safe_path = os.path.join(current_dataset_path, filename)
-    if not os.path.realpath(safe_path).startswith(os.path.realpath(current_dataset_path)):
-        return jsonify({'error': 'Access denied'}), 403
-
-    if not os.path.isfile(safe_path):
-        return jsonify({'error': 'File not found'}), 404
-
-    try:
-        os.remove(safe_path)
-        txt_path = get_caption_path(safe_path)
-        if os.path.exists(txt_path):
-            os.remove(txt_path)
-        with sqlite3.connect(DB_PATH) as conn:
+        prefix = version_path + os.sep
+        db = context.db
+        with sqlite3.connect(db.db_path) as conn:
             c = conn.cursor()
-            c.execute('DELETE FROM image_ratings WHERE dataset_path=? AND filename=?',
-                      (current_dataset_path, filename))
+            for table in ('image_quality', 'image_ratings'):
+                c.execute(f'DELETE FROM {table} WHERE dataset_path = ? OR dataset_path LIKE ?', (version_path, prefix + '%'))
+            c.execute('DELETE FROM similar_pairs WHERE dataset_path = ? OR dataset_path LIKE ?', (version_path, prefix + '%'))
+            c.execute('DELETE FROM duplicate_groups WHERE dataset_path = ? OR dataset_path LIKE ?', (version_path, prefix + '%'))
             conn.commit()
-        delete_image_quality(current_dataset_path, filename)
-        remove_from_duplicate_groups(current_dataset_path, filename)
-        remove_from_similar_pairs(current_dataset_path, filename)
+        meta_path = os.path.join(dataset_path, 'metadata.json')
+        if os.path.exists(meta_path):
+            with open(meta_path, 'r', encoding='utf-8') as f:
+                metadata = json.load(f)
+            if 'versions' in metadata and version in metadata['versions']:
+                del metadata['versions'][version]
+                with open(meta_path, 'w', encoding='utf-8') as f:
+                    json.dump(metadata, f, ensure_ascii=False, indent=2)
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/similar-pairs', methods=['GET'])
-def get_similar_pairs():
-    if not current_dataset_path:
-        return jsonify({'error': 'Датасет не загружен'}), 400
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute('SELECT filename1, filename2, similarity FROM similar_pairs WHERE dataset_path=?', (current_dataset_path,))
-        rows = c.fetchall()
-        pairs = [{'filename1': row[0], 'filename2': row[1], 'similarity': row[2]} for row in rows]
-    return jsonify(pairs)
-
-@app.route('/api/widget-layout', methods=['GET'])
-def get_widget_layout_api():
-    layout_json = get_global_widget_layout()
-    if layout_json:
-        return jsonify({'layout': json.loads(layout_json)})
-    else:
-        return jsonify({'layout': []})
-
-@app.route('/api/widget-layout', methods=['POST'])
-def save_widget_layout_api():
-    data = request.get_json()
-    layout = data.get('layout')
-    if layout is None:
-        return jsonify({'error': 'layout required'}), 400
-    save_global_widget_layout(json.dumps(layout))
-    return jsonify({'success': True})
-
-@app.route('/api/auto-models', methods=['GET'])
-def auto_models():
-    models = tagger.list_models()
-    return jsonify(models)
-
-@app.route('/api/auto-tag/start', methods=['POST'])
-def auto_tag_start():
-    global auto_tag_status
-    if not current_dataset_path:
-        return jsonify({'error': 'Датасет не загружен'}), 400
-    with auto_tag_lock:
-        if auto_tag_status['running']:
-            return jsonify({'error': 'Процесс уже запущен'}), 400
-    data = request.get_json()
-    model = data.get('model')
-    threshold = data.get('threshold', 0.35)
-    mode = data.get('mode', 'append')
-
-    if not model:
-        return jsonify({'error': 'Модель не выбрана'}), 400
-
-    available_models = tagger.list_models()
-    if model not in available_models:
-        return jsonify({'error': f'Модель "{model}" не найдена в папке models'}), 400
-
-    def process():
-        global auto_tag_status
-        images = get_image_files(current_dataset_path)
-        total = len(images)
-        with auto_tag_lock:
-            auto_tag_status['running'] = True
-            auto_tag_status['total'] = total
-            auto_tag_status['processed'] = 0
-            auto_tag_status['current_file'] = ''
-            auto_tag_status['model_name'] = model
-
-        for idx, img in enumerate(images):
-            with auto_tag_lock:
-                if not auto_tag_status['running']:
-                    break
-                auto_tag_status['current_file'] = img
-
-            img_path = os.path.join(current_dataset_path, img)
-            txt_path = get_caption_path(img_path)
-
-            try:
-                new_tags = tagger.tag_image(img_path, model, threshold)
-            except Exception as e:
-                import traceback
-                print(f"Ошибка при обработке {img}: {e}")
-                traceback.print_exc()
-                new_tags = []
-
-            old_caption = read_caption(txt_path)
-            old_tags = parse_tags(old_caption)
-
-            if mode == 'replace':
-                final_tags = new_tags
-            elif mode == 'add_if_empty':
-                if not old_tags:
-                    final_tags = new_tags
-                else:
-                    final_tags = old_tags
-            else:
-                existing_set = set(old_tags)
-                final_tags = old_tags + [tag for tag in new_tags if tag not in existing_set]
-
-            write_caption(txt_path, format_tags(final_tags))
-
-            with auto_tag_lock:
-                auto_tag_status['processed'] = idx + 1
-
-        with auto_tag_lock:
-            auto_tag_status['running'] = False
-            auto_tag_status['current_file'] = ''
-
-    thread = threading.Thread(target=process)
-    thread.start()
-    return jsonify({'success': True})
-
-@app.route('/api/auto-tag/status', methods=['GET'])
-def auto_tag_status_api():
-    with auto_tag_lock:
-        return jsonify(auto_tag_status)
-
-@app.route('/api/auto-tag/stop', methods=['POST'])
-def auto_tag_stop():
-    with auto_tag_lock:
-        auto_tag_status['running'] = False
-    return jsonify({'success': True})
-
+# ------------------------------------------------------------
+# Запуск приложения
+# ------------------------------------------------------------
 if __name__ == '__main__':
     host = get_setting('server_host')
     port = get_setting('server_port')
-    if not host:
-        host = '127.0.0.1'
-    if not port:
-        port = 5000
-    else:
-        port = int(port)
+    if not host: host = '127.0.0.1'
+    if not port: port = 5000
+    else: port = int(port)
+
+    context.active_host = host
+    context.active_port = port
 
     if not os.environ.get('WERKZEUG_RUN_MAIN'):
         if not is_port_available(host, port):
