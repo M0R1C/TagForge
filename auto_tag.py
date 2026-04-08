@@ -4,6 +4,10 @@ import onnxruntime as ort
 from PIL import Image
 import csv
 import logging
+import gc
+import torch
+from typing import List
+import multiprocessing
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -261,6 +265,60 @@ class AutoTagger:
             logger.error(f"Ошибка при обработке {image_path}: {e}", exc_info=True)
             raise
 
+    def get_ratings_from_tensors(self, tensors: List[np.ndarray], model_name: str, batch_size: int = 8) -> List[str]:
+        if model_name not in self.sessions:
+            self._load_model(model_name)
+
+        rating_indices = self.rating_indices.get(model_name, [])
+        if not rating_indices:
+            return ['general'] * len(tensors)
+
+        valid_indices = [i for i, t in enumerate(tensors) if t is not None]
+        valid_tensors = [tensors[i] for i in valid_indices]
+
+        if not valid_tensors:
+            return ['general'] * len(tensors)
+
+        results = ['general'] * len(tensors)
+        session = self.sessions[model_name]
+        input_name = session.get_inputs()[0].name
+        tags = self.labels[model_name]
+
+        for start in range(0, len(valid_tensors), batch_size):
+            end = min(start + batch_size, len(valid_tensors))
+            batch = valid_tensors[start:end]
+            batch_array = np.concatenate(batch, axis=0)
+            outputs = session.run(None, {input_name: batch_array})
+            probs_batch = outputs[0]
+
+            for j, probs in enumerate(probs_batch):
+                probs = probs.flatten()
+                probs, aligned_tags = self._align_output_with_tags(probs, tags)
+                if np.any(probs < 0):
+                    probs = 1.0 / (1.0 + np.exp(-probs))
+
+                rating_probs = []
+                for idx in rating_indices:
+                    if idx < len(probs):
+                        tag = aligned_tags[idx]
+                        prob = probs[idx]
+                        rating_probs.append((tag, prob))
+
+                if not rating_probs:
+                    rating = 'general'
+                else:
+                    best_tag, best_prob = max(rating_probs, key=lambda x: x[1])
+                    rating_part = best_tag.split(':')[-1].lower()
+                    if rating_part in ('general', 'sensitive', 'questionable', 'explicit'):
+                        rating = rating_part
+                    else:
+                        rating = 'general'
+
+                original_idx = valid_indices[start + j]
+                results[original_idx] = rating
+
+        return results
+
     def get_rating(self, image_path, model_name):
         if model_name not in self.sessions:
             success = self._load_model(model_name)
@@ -299,3 +357,199 @@ class AutoTagger:
         except Exception as e:
             logger.error(f"Ошибка при получении рейтинга для {image_path}: {e}")
             return 'general'
+
+    def unload_all(self):
+        self.sessions.clear()
+        self.labels.clear()
+        self.input_shapes.clear()
+        self.layouts.clear()
+        self.input_sizes.clear()
+        self.model_errors.clear()
+        self.rating_indices.clear()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        logger.info("Все модели AutoTagger выгружены, GPU память очищена")
+
+    def tag_images_batch(self, image_paths: List[str], model_name: str, threshold: float = 0.5, batch_size: int = 8) -> \
+    List[List[str]]:
+        if model_name not in self.sessions:
+            self._load_model(model_name)
+
+        preprocessed = []
+        valid_indices = []
+        for idx, path in enumerate(image_paths):
+            try:
+                img_tensor = self.preprocess(path, model_name)
+                preprocessed.append(img_tensor)
+                valid_indices.append(idx)
+            except Exception as e:
+                logger.error(f"Ошибка предобработки {path}: {e}")
+                preprocessed.append(None)
+
+        valid_imgs = [p for p in preprocessed if p is not None]
+        if not valid_imgs:
+            return [[] for _ in image_paths]
+
+        results = [[] for _ in image_paths]
+        session = self.sessions[model_name]
+        input_name = session.get_inputs()[0].name
+        all_tags = self.labels[model_name]
+
+        for i in range(0, len(valid_imgs), batch_size):
+            batch = valid_imgs[i:i + batch_size]
+            batch_array = np.concatenate(batch, axis=0)
+            outputs = session.run(None, {input_name: batch_array})
+            probs_batch = outputs[0]
+
+            for j, probs in enumerate(probs_batch):
+                probs = probs.flatten()
+                probs, aligned_tags = self._align_output_with_tags(probs, all_tags)
+                if np.any(probs < 0):
+                    probs = 1.0 / (1.0 + np.exp(-probs))
+
+                min_len = min(len(probs), len(aligned_tags))
+                probs = probs[:min_len]
+                tags_trim = aligned_tags[:min_len]
+
+                selected_with_prob = []
+                for k in range(len(tags_trim)):
+                    if probs[k] >= threshold:
+                        original_tag = tags_trim[k]
+                        display_tag = original_tag
+                        if not display_tag.startswith('rating:'):
+                            display_tag = display_tag.replace('_', ' ')
+                        selected_with_prob.append((display_tag, probs[k]))
+
+                selected_with_prob.sort(key=lambda x: x[1], reverse=True)
+                selected_tags = [tag for tag, _ in selected_with_prob]
+
+                original_idx = valid_indices[i + j]
+                results[original_idx] = selected_tags
+
+        return results
+
+    def preprocess_batch(self, image_paths: List[str], model_name: str) -> List[np.ndarray]:
+        from concurrent.futures import ThreadPoolExecutor
+
+        cpu_count = multiprocessing.cpu_count()
+        workers = max(1, cpu_count // 2)
+        workers = min(workers, 6)
+        workers = min(workers, len(image_paths))
+
+        def _preprocess_one(path):
+            try:
+                return self.preprocess(path, model_name)
+            except Exception as e:
+                logger.error(f"Ошибка предобработки {path}: {e}")
+                return None
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            results = list(executor.map(_preprocess_one, image_paths))
+        return results
+
+    def tag_images_batch_from_tensors(self, tensors: List[np.ndarray], model_name: str,
+                                      threshold: float = 0.5, batch_size: int = 8) -> List[List[str]]:
+
+        if model_name not in self.sessions:
+            self._load_model(model_name)
+
+        valid_indices = [i for i, t in enumerate(tensors) if t is not None]
+        valid_tensors = [tensors[i] for i in valid_indices]
+
+        if not valid_tensors:
+            return [[] for _ in tensors]
+
+        results = [[] for _ in tensors]
+        session = self.sessions[model_name]
+        input_name = session.get_inputs()[0].name
+        all_tags = self.labels[model_name]
+
+        for i in range(0, len(valid_tensors), batch_size):
+            batch = valid_tensors[i:i + batch_size]
+            batch_array = np.concatenate(batch, axis=0)
+            outputs = session.run(None, {input_name: batch_array})
+            probs_batch = outputs[0]
+
+            for j, probs in enumerate(probs_batch):
+                probs = probs.flatten()
+                probs, aligned_tags = self._align_output_with_tags(probs, all_tags)
+                if np.any(probs < 0):
+                    probs = 1.0 / (1.0 + np.exp(-probs))
+
+                min_len = min(len(probs), len(aligned_tags))
+                probs = probs[:min_len]
+                tags_trim = aligned_tags[:min_len]
+
+                selected_with_prob = []
+                for k in range(len(tags_trim)):
+                    if probs[k] >= threshold:
+                        original_tag = tags_trim[k]
+                        display_tag = original_tag
+                        if not display_tag.startswith('rating:'):
+                            display_tag = display_tag.replace('_', ' ')
+                        selected_with_prob.append((display_tag, probs[k]))
+
+                selected_with_prob.sort(key=lambda x: x[1], reverse=True)
+                selected_tags = [tag for tag, _ in selected_with_prob]
+
+                original_idx = valid_indices[i + j]
+                results[original_idx] = selected_tags
+
+        return results
+
+    def get_ratings_batch(self, image_paths: List[str], model_name: str, batch_size: int = 8) -> List[str]:
+        if model_name not in self.sessions:
+            self._load_model(model_name)
+
+        rating_indices = self.rating_indices.get(model_name, [])
+        if not rating_indices:
+            return ['general'] * len(image_paths)
+
+        tensors = self.preprocess_batch(image_paths, model_name)
+
+        results = ['general'] * len(image_paths)
+        valid_indices = [i for i, t in enumerate(tensors) if t is not None]
+        valid_tensors = [tensors[i] for i in valid_indices]
+
+        if not valid_tensors:
+            return results
+
+        session = self.sessions[model_name]
+        input_name = session.get_inputs()[0].name
+        tags = self.labels[model_name]
+
+        for start in range(0, len(valid_tensors), batch_size):
+            end = min(start + batch_size, len(valid_tensors))
+            batch = valid_tensors[start:end]
+            batch_array = np.concatenate(batch, axis=0)
+            outputs = session.run(None, {input_name: batch_array})
+            probs_batch = outputs[0]
+
+            for j, probs in enumerate(probs_batch):
+                probs = probs.flatten()
+                probs, aligned_tags = self._align_output_with_tags(probs, tags)
+                if np.any(probs < 0):
+                    probs = 1.0 / (1.0 + np.exp(-probs))
+
+                rating_probs = []
+                for idx in rating_indices:
+                    if idx < len(probs):
+                        tag = aligned_tags[idx]
+                        prob = probs[idx]
+                        rating_probs.append((tag, prob))
+
+                if not rating_probs:
+                    rating = 'general'
+                else:
+                    best_tag, best_prob = max(rating_probs, key=lambda x: x[1])
+                    rating_part = best_tag.split(':')[-1].lower()
+                    if rating_part in ('general', 'sensitive', 'questionable', 'explicit'):
+                        rating = rating_part
+                    else:
+                        rating = 'general'
+
+                original_idx = valid_indices[start + j]
+                results[original_idx] = rating
+
+        return results
