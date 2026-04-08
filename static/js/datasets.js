@@ -13,6 +13,7 @@
     const folderIconSvg = '<svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7l-2-2H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2z"/></svg>';
 
     window.DatasetsTab = {
+        _scrollToRestore: null,
         init: function(container) {
             currentContainer = container;
             fetch('/api/flags')
@@ -61,7 +62,13 @@
                 });
         },
 
-        browse: function() {
+        browse: function(preserveScroll = false) {
+            // Сохраняем позицию, если запрошено
+            if (preserveScroll) {
+                const mainContent = document.getElementById('mainContent');
+                this._scrollToRestore = mainContent ? mainContent.scrollTop : null;
+            }
+
             fetch(`/api/datasets/${encodeURIComponent(currentDataset)}/browse?path=${encodeURIComponent(currentPath)}`)
                 .then(res => res.json())
                 .then(data => {
@@ -70,6 +77,14 @@
                         return;
                     }
                     renderDatasetBrowser(data);
+                    // Восстанавливаем позицию после рендеринга
+                    if (this._scrollToRestore !== null) {
+                        const mainContent = document.getElementById('mainContent');
+                        if (mainContent) {
+                            mainContent.scrollTop = this._scrollToRestore;
+                        }
+                        this._scrollToRestore = null;
+                    }
                 })
                 .catch(err => alert('Ошибка: ' + err));
         },
@@ -632,6 +647,7 @@
             overlay.style.height = (visibleBottom - visibleTop) + 'px';
         }
 
+        // 👇 Восстанавливаем dragenter
         browserMain.addEventListener('dragenter', (e) => {
             e.preventDefault();
             dragCounter++;
@@ -657,13 +673,13 @@
             }
         });
 
+        // 👇 Один обработчик drop (удалите второй такой же)
         browserMain.addEventListener('drop', (e) => {
             e.preventDefault();
             dragCounter = 0;
             overlay.classList.remove('show');
             unblockScroll();
-            const items = e.dataTransfer.items;
-            handleDrop(items);
+            handleDrop(e);   // передаём event, а не items
         });
 
         document.addEventListener('dragleave', (e) => {
@@ -687,18 +703,180 @@
         });
     }
 
-    function handleDrop(items) {
-        const filePromises = [];
-        for (let i = 0; i < items.length; i++) {
-            const entry = items[i].webkitGetAsEntry();
-            if (entry) {
-                filePromises.push(processEntry(entry));
+    async function handleDrop(event) {
+        const items = event.dataTransfer.items;
+        const filesToUpload = [];
+        const allImageUrls = new Set();
+        const dataImageBlobs = [];
+
+        function addUrl(url) {
+            if (!url) return;
+            if (url.startsWith('data:image')) {
+                try {
+                    const blob = dataURItoBlob(url);
+                    if (blob) dataImageBlobs.push(blob);
+                } catch(e) { console.warn('Ошибка data:image', e); }
+            } else {
+                allImageUrls.add(url);
             }
         }
-        Promise.all(filePromises).then(filesArray => {
-            const allFiles = filesArray.flat();
-            uploadFiles(allFiles);
+
+        // 1. Реальные файлы/папки
+        for (let i = 0; i < items.length; i++) {
+            const item = items[i];
+            const entry = item.webkitGetAsEntry();
+            if (entry) {
+                const nestedFiles = await processEntry(entry);
+                filesToUpload.push(...nestedFiles);
+            } else {
+                const file = item.getAsFile();
+                if (file && file.type.startsWith('image/')) {
+                    filesToUpload.push(file);
+                }
+            }
+        }
+
+        // 2. URL из dataTransfer (текст, HTML, URI-list)
+        const formats = ['text/uri-list', 'text/html', 'text/plain'];
+        for (const format of formats) {
+            const data = event.dataTransfer.getData(format);
+            if (data) {
+                const urls = extractAllImageUrls(data);
+                urls.forEach(addUrl);
+            }
+        }
+
+        // Приоритет: если есть реальные файлы — загружаем только их
+        if (filesToUpload.length > 0) {
+            uploadFiles(filesToUpload);
+            return;
+        }
+
+        // Если нет файлов, но есть URL — берём лучший
+        if (allImageUrls.size > 0) {
+            const bestUrl = selectBestImageUrl(Array.from(allImageUrls));
+            if (bestUrl) await uploadImageUrl(bestUrl);
+            return;
+        }
+
+        // Если только data:image — превращаем в файлы
+        if (dataImageBlobs.length > 0) {
+            const blobFiles = dataImageBlobs.map((blob, i) =>
+                new File([blob], `drag_drop_image_${Date.now()}_${i}.png`, { type: 'image/png' })
+            );
+            uploadFiles(blobFiles);
+        }
+    }
+
+    function dataURItoBlob(dataURI) {
+        const byteString = atob(dataURI.split(',')[1]);
+        const mimeString = dataURI.split(',')[0].split(':')[1].split(';')[0];
+        const ab = new ArrayBuffer(byteString.length);
+        const ia = new Uint8Array(ab);
+        for (let i = 0; i < byteString.length; i++) {
+            ia[i] = byteString.charCodeAt(i);
+        }
+        return new Blob([ab], { type: mimeString });
+    }
+
+    function extractAllImageUrls(str) {
+        if (!str) return [];
+        const urls = new Set();
+
+        // 1. Прямые ссылки на изображения (jpg, png, webp, gif, bmp)
+        const directPattern = /(https?:\/\/[^\s<>"']+\.(jpg|jpeg|png|webp|gif|bmp)(?:\?[^\s<>"']*)?)/gi;
+        let match;
+        while ((match = directPattern.exec(str)) !== null) {
+            urls.add(match[1]);
+        }
+
+        // 2. Ссылки внутри тегов <img src="..."> и <img srcset="...">
+        const imgPattern = /<img[^>]+(?:src|srcset)=["']([^"']+)["']/gi;
+        while ((match = imgPattern.exec(str)) !== null) {
+            let url = match[1];
+            // Если srcset содержит несколько URL, берём первый (можно улучшить)
+            if (url.includes(',')) url = url.split(',')[0].trim().split(' ')[0];
+            if (url.startsWith('http')) urls.add(url);
+        }
+
+        // 3. Ссылки на изображения без расширения (например, /image?id=123)
+        //    Применяем только если строка похожа на URL и не содержит явно расширение
+        const genericUrlPattern = /(https?:\/\/[^\s<>"']+)/gi;
+        while ((match = genericUrlPattern.exec(str)) !== null) {
+            let url = match[1];
+            // Отбрасываем явно не-изображения (html, css, js)
+            if (/\.(html|css|js|json|xml)(\?|$)/i.test(url)) continue;
+            // Если нет точки в последнем сегменте или расширение не изображение – всё равно добавим,
+            // сервер сам проверит Content-Type
+            if (!urls.has(url) && !url.includes('.txt') && !url.includes('.pdf')) {
+                urls.add(url);
+            }
+        }
+
+        // 4. data:image (иногда бывают)
+        const dataPattern = /data:image\/[^;]+;base64,[^"'\s]+/gi;
+        while ((match = dataPattern.exec(str)) !== null) {
+            urls.add(match[0]);
+        }
+
+        return Array.from(urls);
+    }
+
+    // Выбирает лучший URL из списка
+    function selectBestImageUrl(urls) {
+        if (!urls || urls.length === 0) return null;
+        const httpUrls = urls.filter(u => u.startsWith('http'));
+        const dataUrls = urls.filter(u => u.startsWith('data:'));
+        let candidates = httpUrls.length ? httpUrls : dataUrls;
+        if (candidates.length === 0) return null;
+
+        candidates.sort((a, b) => {
+            const getScore = (url) => {
+                let score = 0;
+                const lower = url.toLowerCase();
+                if (/(original|full|max|high|large|origin)/i.test(lower)) score += 10;
+                if (/\.(jpg|jpeg|png|webp|gif|bmp)(\?|$)/i.test(lower)) score += 5;
+                score += Math.min(5, url.length / 100);
+                if (/(thumb|thumbnail|small|icon|preview)/i.test(lower)) score -= 20;
+                return score;
+            };
+            return getScore(b) - getScore(a);
         });
+        console.log('Выбран лучший URL:', candidates[0]);
+        return candidates[0];
+    }
+
+    function extractImageUrl(str) {
+        if (!str) return null;
+        // Прямая ссылка на изображение
+        const urlPattern = /(https?:\/\/[^\s]+\.(jpg|jpeg|png|webp)(\?[^\s]*)?)/i;
+        let match = str.match(urlPattern);
+        if (match) return match[1];
+
+        // Поиск внутри HTML тега img
+        const imgPattern = /<img[^>]+src=["']([^"']+)["']/i;
+        match = str.match(imgPattern);
+        if (match) return match[1];
+
+        return null;
+    }
+
+    async function uploadImageUrl(url) {
+        console.log('Загрузка URL:', url);
+        const response = await fetch(`/api/datasets/${encodeURIComponent(currentDataset)}/upload-url`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url: url, path: currentPath })
+        });
+        const data = await response.json();
+        if (data.error) {
+            console.error('Upload URL error:', data.error);
+            alert('Не удалось загрузить изображение: ' + data.error);
+        } else {
+            console.log('Успешно загружено:', data.filename);
+            window.DatasetsTab.browse(true);   // ← обновляем с сохранением скролла
+        }
+        return data;
     }
 
     function processEntry(entry) {
@@ -730,9 +908,7 @@
 
     function uploadFiles(files) {
         const formData = new FormData();
-        files.forEach(file => {
-            formData.append('files', file);
-        });
+        files.forEach(file => formData.append('files', file));
         formData.append('path', currentPath);
         fetch(`/api/datasets/${encodeURIComponent(currentDataset)}/upload`, {
             method: 'POST',
@@ -743,7 +919,7 @@
             if (data.error) {
                 alert(data.error);
             } else {
-                window.DatasetsTab.browse();
+                window.DatasetsTab.browse(true); // ← сохраняем скролл
             }
         })
         .catch(err => alert('Ошибка: ' + err));
@@ -1469,7 +1645,7 @@
                         }
                     }
                 }
-                window.DatasetsTab.browse();
+                window.DatasetsTab.browse(true); // ← сохраняем скролл
             }
         })
         .catch(err => alert('Ошибка: ' + err));
@@ -1496,7 +1672,7 @@
                         if (typeof window.reloadDuplicateData === 'function') window.reloadDuplicateData();
                     }
                 }
-                window.DatasetsTab.browse();
+                window.DatasetsTab.browse(true); // ← сохраняем скролл
             }
         })
         .catch(err => alert('Ошибка: ' + err));
